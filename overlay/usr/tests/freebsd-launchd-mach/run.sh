@@ -1662,6 +1662,41 @@ da_iokit_gate()
 }
 da_iokit_gate
 
+# LINUX-MOUNTS — #190. launchctl bootstrap (linux_abi_mounts() in
+# support/launchctl.c) mounts the five Linux ABI filesystems under
+# compat.linux.emul_path at every boot, even with no Linux userland installed
+# (rc.d/linux's behaviour), plus a nullfs of /tmp. mount -p shows only generic
+# flags, so linrdlnk and the shm size cap are checked by behaviour.
+# Emits exactly one LINUX-MOUNTS-OK/FAIL.
+linux_mounts_gate()
+{
+    emul=$(sysctl -n compat.linux.emul_path 2>/dev/null)
+    emul=${emul:-/compat/linux}
+    missing=
+    for w in linprocfs:$emul/proc linsysfs:$emul/sys devfs:$emul/dev fdescfs:$emul/dev/fd tmpfs:$emul/dev/shm nullfs:$emul/tmp; do
+        fs=${w%%:*}; p=${w#*:}
+        mount -p 2>/dev/null | awk -v p="$p" -v f="$fs" '$2 == p && $3 == f { ok = 1 } END { exit !ok }' || missing="$missing $w"
+    done
+    echo "--- Linux ABI mounts under $emul:"
+    mount -p 2>/dev/null | awk -v e="$emul" 'index($2, e) == 1'
+    if [ -n "$missing" ]; then
+        echo "LINUX-MOUNTS-FAIL: not mounted at boot:$missing"
+        return 0
+    fi
+    if [ "$(stat -f %HT "$emul/dev/fd/0" 2>/dev/null)" != "Symbolic Link" ]; then
+        echo "LINUX-MOUNTS-FAIL: $emul/dev/fd/0 is '$(stat -f %HT "$emul/dev/fd/0" 2>&1)', expected a symlink (fdescfs linrdlnk)"
+        return 0
+    fi
+    shm_kb=$(df -k "$emul/dev/shm" | awk 'NR == 2 { print $2 }')
+    mem_kb=$(( $(sysctl -n hw.physmem) / 1024 ))
+    if [ -z "$shm_kb" ] || [ "$shm_kb" -ge $((mem_kb * 9 / 10)) ]; then
+        echo "LINUX-MOUNTS-FAIL: $emul/dev/shm is ${shm_kb:-?} KB of ${mem_kb} KB RAM; expected a size cap"
+        return 0
+    fi
+    echo "LINUX-MOUNTS-OK: five Linux ABI mounts + /tmp nullfs under $emul at boot (launchctl bootstrap)"
+}
+linux_mounts_gate
+
 ipconfig_cli=/usr/sbin/ipconfig
 if [ ! -x "$ipconfig_cli" ]; then
     echo "IPCFG-IPCONFIG-FAIL: $ipconfig_cli missing"
