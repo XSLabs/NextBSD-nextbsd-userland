@@ -44,7 +44,7 @@ on:
       harness_ref:
         description: 'nextbsd/nextbsd-ci ref the boot lane checks out (T4). Pinned to the shared release tag the 4-repo lockstep lands on, so this lane does not drift with nextbsd-ci main.'
         required: false
-        default: 'v0.2.0'
+        default: 'v0.2.1'
         type: string
       fbsd_sha:
         description: 'pinned FreeBSD SHA for the toolchain image tag (blank = latest)'
@@ -259,9 +259,10 @@ jobs:
       # — the shared nextbsd-ci harness is (one loader contract, one sentinel
       # protocol, one audited marker manifest, every repo). Pinning a tag (not
       # main) is what keeps this lane from drifting with harness development.
-      # v0.2.0 is the first real-image-validated cut: it carries the panic-arm
-      # colon fix and the FBSDGLUE userland overlay that a real amd64/arm64
-      # boot surfaced (the mock had never exercised either path).
+      # v0.2.1 = v0.2.0 (the first real-image-validated cut: the panic-arm colon
+      # fix + the FBSDGLUE userland overlay a real amd64/arm64 boot surfaced)
+      # plus a login-only mode the other three lockstep consumers need. The
+      # userland lane runs a suite, so the login-only addition is inert here.
       - uses: actions/checkout@v4
         with:
           repository: nextbsd/nextbsd-ci
