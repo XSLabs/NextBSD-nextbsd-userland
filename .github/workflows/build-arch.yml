@@ -44,7 +44,7 @@ on:
       harness_ref:
         description: 'nextbsd/nextbsd-ci ref the boot lane checks out (T4). Pinned to the shared release tag the 4-repo lockstep lands on, so this lane does not drift with nextbsd-ci main.'
         required: false
-        default: 'v0.2.2'
+        default: 'v0.2.3'
         type: string
       fbsd_sha:
         description: 'pinned FreeBSD SHA for the toolchain image tag (blank = latest)'
@@ -254,17 +254,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4          # userland repo: workspace root; the image artifact lands here
       # T4: the shared boot harness, pinned to the release tag (harness_ref,
-      # v0.2.2) the 4-repo lockstep lands on. The in-repo tests/boot-test.sh
+      # v0.2.3) the 4-repo lockstep lands on. The in-repo tests/boot-test.sh
       # fork (73 KB) stays in the tree as the fallback but is no longer the gate
       # — the shared nextbsd-ci harness is (one loader contract, one sentinel
       # protocol, one audited marker manifest, every repo). Pinning a tag (not
       # main) is what keeps this lane from drifting with harness development.
-      # v0.2.2 = v0.2.1 (v0.2.0 + login-only) plus a capped post-banner
-      # login-wait window (180s): an autologin image with a console-lost
-      # session message (arm64) now probes for a shell quickly instead of
-      # waiting out the whole NB_TIMEOUT_GLOBAL (the 30-min "hang"). The
-      # userland lane runs a suite, so the login-only mode is inert here; the
-      # login-wait cap only makes the login stage faster.
+      # v0.2.3 = v0.2.2 (v0.2.1 + the 180s login-wait cap) plus a reworked
+      # login stage: it gates on the nextbsd-fetch banner ("Welcome to
+      # NextBSD!", printed inside the shell after the autologin) and then on
+      # the shell prompt, so the login stage resolves in seconds instead of
+      # waiting out the capped window (the arm64 30-min "hang"). The userland
+      # lane runs a suite, so the login-only mode is inert here; the banner
+      # + prompt gate only makes the login stage faster.
       - uses: actions/checkout@v4
         with:
           repository: nextbsd/nextbsd-ci
