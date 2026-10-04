@@ -42,9 +42,9 @@ on:
         default: 'full'
         type: string
       harness_ref:
-        description: 'nextbsd/nextbsd-ci ref the boot lane checks out (T4). Pinned to the shared release tag the 4-repo lockstep lands on, so this lane does not drift with nextbsd-ci main.'
+        description: 'nextbsd/nextbsd-ci ref this lane checks out (T4): the shared image assembly (scripts/assemble-image.sh) AND the boot harness. Pinned to the release tag the 4-repo lockstep lands on, so neither drifts with nextbsd-ci main.'
         required: false
-        default: 'v0.3.0'
+        default: 'v0.3.1'
         type: string
       fbsd_sha:
         description: 'pinned FreeBSD SHA for the toolchain image tag (blank = latest)'
@@ -72,7 +72,7 @@ jobs:
       - name: Checkout nextbsd-kernel (mach_port.defs for the libmach client)
         uses: actions/checkout@v4
         with:
-          repository: nextbsd-redux/nextbsd-kernel
+          repository: nextbsd/nextbsd-kernel
           ref: main
           path: .kernel
 
@@ -90,7 +90,7 @@ jobs:
         run: |
           mkdir -p "$GITHUB_WORKSPACE/sysroot"
           gh release download continuous \
-            --repo nextbsd-redux/nextbsd-freebsd-compat \
+            --repo nextbsd/nextbsd-freebsd-compat \
             --pattern "nextbsd-base-${{ inputs.arch }}.tar.gz" \
             --output /tmp/base.tar.gz --clobber
           tar -C "$GITHUB_WORKSPACE/sysroot" -xzf /tmp/base.tar.gz
@@ -153,7 +153,14 @@ jobs:
       # separate qemu boot job (needs a non-container KVM runner). Runs for both
       # arches (assemble-image.sh handles arm64's UEFI-only mkimg); overlay is
       # vendored at ./overlay.
-      - name: Assemble disk.img (reuse staged base + built userland)
+      - name: Checkout shared assembly + boot harness (nextbsd-ci, pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: nextbsd/nextbsd-ci
+          ref: ${{ inputs.harness_ref }}
+          path: nextbsd-ci
+
+      - name: Assemble disk.img (shared nextbsd-ci assembly)
         if: github.event_name == 'pull_request'
         env:
           # This step only READS public `continuous` assets from sibling repos
@@ -173,7 +180,7 @@ jobs:
           WORK: ${{ github.workspace }}/nbimg
         run: |
           mkdir -p art
-          gh release download continuous -R nextbsd-redux/nextbsd-kernel \
+          gh release download continuous -R nextbsd/nextbsd-kernel \
             --pattern 'nextbsd-kernel-${{ inputs.arch }}.tar.gz' --dir art --clobber
           # Third-party base programs (sudo, zsh, pico) from nextbsd-contrib, so
           # the boot test's SUDO check runs against the real image layout.
@@ -195,43 +202,28 @@ jobs:
               gh release download continuous -R nextbsd/nextbsd-kernel-extensions \
                 --pattern "$p" --dir art --clobber || true
             done
-          elif [ -f art/graphics-kexts-arm64.tar.gz ]; then
-            # arm64 ships its real kexts -- IOGraphics, TTM, DMABuf,
-            # LinuxVirtIO, IOGraphicsShmem, IOGraphicsExtras -- minus
-            # VirtIOGraphics.kext ONLY. nextbsd-kernel#170.
-            #
-            # That one bundle cannot ship yet. The IOKit catalogue asks for it
-            # whenever it sees an attached vtgpu (iocat_vtgpu_shadowed() reads
-            # that as "console yes, KMS no, kext wanted"), and its DRM probe
-            # calls drm_aperture_remove_conflicting_pci_framebuffers() to evict
-            # the framebuffer owner. On amd64 that evicts efifb, a placeholder,
-            # and vgapci0 survives. On arm64 vtgpu IS the only console -- no EFI
-            # GOP for vt_efifb -- so it evicts the console itself and vt(4)
-            # faults writing to the dead device:
-            #
-            #   VT: Switching back from "virtio_gpu" to "virtio_gpu".
-            #   vtgpu0: detached
-            #   panic: data abort in critical section or under mutex
-            #   esr 0x96000047 (write, translation fault L3), Uptime: 11s
-            #
-            # Restore the bundle when #170 lands.
-            mkdir -p art/gk
-            tar -C art/gk -xzf art/graphics-kexts-arm64.tar.gz
-            rm -rf art/gk/VirtIOGraphics.kext
-            tar -C art/gk -czf art/graphics-kexts-arm64.tar.gz .
-            rm -rf art/gk
           fi
+          # NOTE (arm64 VirtIOGraphics, was nextbsd-kernel#170): the arm64
+          # graphics set ships RAW, VirtIOGraphics.kext included. The old
+          # consumer-side strip (re-tar without the bundle) is gone: the
+          # kernel-side fix landed (#252 restored the base vgpu driver plus
+          # patch 0058's vt_deallocate, which stops the DRM probe evicting the
+          # only console), and the continuous artifact carries the bundle. The
+          # boot test below is the arbiter -- if the eviction regresses, this
+          # lane fails at the prompt, exactly as it should.
           export MODULES_TGZ="$(ls art/*kext*.tar.gz 2>/dev/null | tr '\n' ' ')"
           echo "kexts for ${ARCH}: ${MODULES_TGZ:-<none>}"
           # pkg-free /etc seed: fetch nextbsd-overlays via the API (no git needed
           # in the container) so the stripped userland package's missing /etc is
           # seeded, exactly like nextbsd/build.sh does for the real image.
-          gh api repos/nextbsd-redux/nextbsd-overlays/tarball/main > /tmp/overlays.tar.gz
+          gh api repos/nextbsd/nextbsd-overlays/tarball/main > /tmp/overlays.tar.gz
           mkdir -p "$WORK/seed"
           tar -C "$WORK/seed" --strip-components=1 -xzf /tmp/overlays.tar.gz
           export SEED_ROOTFS="$WORK/seed/rootfs"
-          chmod +x ci/assemble-image.sh
-          ./ci/assemble-image.sh
+          # The SHARED assembly (nextbsd-ci, checked out above at the pinned
+          # release tag) replaces this lane's old private ci/ copy: one recipe
+          # for every consumer (nextbsd, userland, kext lane).
+          sh nextbsd-ci/scripts/assemble-image.sh
 
       - name: Upload native-assembled image
         if: github.event_name == 'pull_request'
@@ -254,15 +246,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4          # userland repo: workspace root; the image artifact lands here
       # T4: the shared boot harness, pinned to the release tag (harness_ref,
-      # v0.3.0) the 4-repo lockstep lands on. The in-repo tests/boot-test.sh
+      # v0.3.1) the 4-repo lockstep lands on. The in-repo tests/boot-test.sh
       # fork (73 KB) stays in the tree as the fallback but is no longer the gate
       # — the shared nextbsd-ci harness is (one loader contract, one sentinel
       # protocol, one audited marker manifest, every repo). Pinning a tag (not
       # main) is what keeps this lane from drifting with harness development.
-      # v0.3.0 = v0.2.3 plus -device virtio-gpu-pci on the amd64 q35 shape (T6;
-      # the arm64 virt machine already had it). For this lane the device is
-      # unbound and inert — the userland image ships no graphics kext — so the
-      # bump is behavior-neutral; this PR's re-run confirms it.
+      # v0.3.1 = v0.3.0 (T6: -device virtio-gpu-pci on the amd64 q35 shape) plus
+      # the shared scripts/assemble-image.sh. Note the assembled image now ships
+      # the graphics kexts RAW (the stale #170 arm64 VirtIOGraphics strip is
+      # gone — the kernel-side fix landed in #252/patch 0058), so this boot is
+      # also the first userland-lane validation of that.
       - uses: actions/checkout@v4
         with:
           repository: nextbsd/nextbsd-ci
