@@ -18,6 +18,14 @@ name: Build NextBSD Userland (Darwin system layer)
 on:
   repository_dispatch:
     types: [base-updated]        # from nextbsd-freebsd-compat after its base `continuous` refresh
+  push:
+    # T10 (nextbsd-ci#12): a merged PR must rebuild + refresh `continuous` the
+    # way nextbsd-kernel already does (paths-gated push, same paths as the
+    # pull_request trigger). Without it a merge to main fired a push event
+    # nothing listened for, so the maintainer had to run workflow_dispatch by
+    # hand. pull_request runs never publish (publish is gated on refs/heads/main),
+    # so this is the only new publication path: merge = rebuild + publish.
+    paths: ['src/**', 'build-userland.sh', 'cmake/**', 'ci/**', 'tests/**', 'overlay/**', '.github/workflows/build.yml', '.github/workflows/build-arch.yml']
   pull_request:
     paths: ['src/**', 'build-userland.sh', 'cmake/**', 'ci/**', 'tests/**', 'overlay/**', '.github/workflows/build.yml', '.github/workflows/build-arch.yml']
   workflow_dispatch:
@@ -63,15 +71,14 @@ jobs:
       target_arch: amd64
       boot: true                 # x86 runner KVM-boots the amd64 image
       boot_soft: false           # GATING. A failed marker now fails the lane (#159).
-                                 # The two markers this was waiting on are fixed: SYSLOG-RUN by the
+                                 # Everything this was waiting on is fixed: SYSLOG-RUN by the
                                  # aslmanager boot-stall removal (#143), IPCFG-ARP by surfacing its
-                                 # result to the console. Both verified passing on amd64.
-                                 #
-                                 # This WILL be red until #158 is fixed -- scrltest and
-                                 # test_libdispatch_mach both SIGSEGV in teardown AFTER passing, so
-                                 # their success markers never reach the stream. That is the point:
-                                 # a suite that reports green while two tests crash is worse than a
-                                 # red one, and boot_soft was hiding exactly that.
+                                 # result to the console, and the scrltest + test_libdispatch_mach
+                                 # teardown SIGSEGV (#158, closed) -- a crash in teardown now
+                                 # reports through the sentinel + exit code instead of being hidden.
+                                 # boot_soft is retired for good: a suite that reports green while
+                                 # two tests crash is worse than a red one, so a failed marker
+                                 # fails the lane.
       boot_gate: full            # boot -> login -> on-image Mach/launchd/configd suite
       fbsd_sha: ${{ github.event.client_payload.fbsd_sha || inputs.fbsd_sha }}
     secrets: inherit
@@ -83,7 +90,7 @@ jobs:
       target_arch: aarch64
       boot: true                 # qemu-system-aarch64 on a native arm64 runner
       boot_runner: ubuntu-24.04-arm
-      boot_soft: false           # GATING -- see the amd64 note above (#159, blocked on #158).
+      boot_soft: false           # GATING -- see the amd64 note above (#159; the #158 teardown SIGSEGV it was blocked on is fixed).
       boot_gate: full            # post-login hang was getty std.9600 vs pl011 DCD (nextbsd#355), fixed by 3wire.9600 — run the full suite
       fbsd_sha: ${{ github.event.client_payload.fbsd_sha || inputs.fbsd_sha }}
     secrets: inherit
@@ -111,33 +118,9 @@ jobs:
           prerelease: true
           fail_on_unmatched_files: true
           files: out/*.tar.gz
-      # Cascade to the downstream consumers ONLY on a real upstream change,
-      # after `continuous` is refreshed (mirrors compat/kernel). userland's
-      # publish is the SINGLE producer that fans out to both the ISO builder
-      # (nextbsd) and the package builder (nextbsd-pkg) — nextbsd-pkg is
-      # triggered by userland-updated alone (maintainer decision; kernel/kext-only
-      # changes use nextbsd-pkg's workflow_dispatch escape hatch).
-      - name: Trigger the downstream ISO build
-        if: github.event_name == 'repository_dispatch'
-        env:
-          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
-          SHA: ${{ github.event.client_payload.fbsd_sha }}
-        run: |
-          # The userland artifact is already published by now, so a downstream
-          # repo the token cannot reach must not mark this build failed. Each
-          # dispatch reports on its own and a miss becomes a warning.
-          # nextbsd-pkg is deliberately NOT here. It assembles the
-          # repository consumers install from, so publishing it is a manual
-          # decision a person makes once the components are known good --
-          # an automatic rebuild would republish whatever just merged before
-          # anyone had looked at it. See nextbsd/nextbsd-pkg#16.
-          for repo in nextbsd/nextbsd; do
-            if gh api "repos/$repo/dispatches" \
-                 -f event_type=userland-updated \
-                 -f "client_payload[fbsd_sha]=$SHA"; then
-              echo "dispatched userland-updated to $repo"
-            else
-              echo "::warning::could not dispatch userland-updated to $repo (DISPATCH_TOKEN may lack access); it will not rebuild against this userland"
-            fi
-          done
-          exit 0
+      # T11 (nextbsd-ci#13): the downstream cascade stops HERE. userland's
+      # publish used to fan out `userland-updated` to the ISO builder
+      # (nextbsd/nextbsd); that trigger is gone (nextbsd now builds on
+      # push/PR/workflow_dispatch only). nextbsd-pkg was already excluded
+      # (manual publish, nextbsd/nextbsd-pkg#16), so there is no consumer
+      # left to dispatch to.

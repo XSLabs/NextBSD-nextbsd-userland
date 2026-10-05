@@ -99,8 +99,8 @@ kernel → PID-1 handoff — that is how `tests/boot-test.sh` drives them under 
 
 | Flag | Kind | Read by | Effect |
 |------|------|---------|--------|
-| `boot_mutemsgs` | loader var → `RB_MUTEMSGS` | kernel | Mutes kernel `printf` to the console after the copyright banner. Shipped as `YES` by [nextbsd-overlays](https://github.com/nextbsd-redux/nextbsd-overlays) (`/boot/loader.conf.d/nextbsd.conf`) so IOKit/kext spew never clobbers the getty `login:` prompt. |
-| `mach.debug_enable` | sysctl, `CTLFLAG_RWTUN` | **kernel** ([nextbsd-kernel](https://github.com/nextbsd-redux/nextbsd-kernel)) | Mach IPC + launchd dispatch trace. Emits `[T41] <comm>:<tid> …` via kernel `printf`, filtered to processes whose `p_comm` starts `lau` (launchd/launchctl/launchproxy). |
+| `boot_mutemsgs` | loader var → `RB_MUTEMSGS` | kernel | Mutes kernel `printf` to the console after the copyright banner. Shipped as `YES` by [nextbsd-overlays](https://github.com/nextbsd/nextbsd-overlays) (`/boot/loader.conf.d/nextbsd.conf`) so IOKit/kext spew never clobbers the getty `login:` prompt. |
+| `mach.debug_enable` | sysctl, `CTLFLAG_RWTUN` | **kernel** ([nextbsd-kernel](https://github.com/nextbsd/nextbsd-kernel)) | Mach IPC + launchd dispatch trace. Emits `[T41] <comm>:<tid> …` via kernel `printf`, filtered to processes whose `p_comm` starts `lau` (launchd/launchctl/launchproxy). |
 | `launchd_trace` | kenv | **userland** (this repo: `launchd`, `liblaunch`, `libxpc`) | `[T41-*]` / `[T39-*]` trace points. Emits to `stderr`. Each consumer reads the kenv independently — `libxpc` and `liblaunch` lazily on first call, since they run in daemons that can't see launchd's global. |
 | `BOOT_TRACE` | env var for `tests/boot-test.sh` | the test harness | `BOOT_TRACE=1` makes the harness set both `mach.debug_enable=1` and `launchd_trace=1` at the loader. |
 
@@ -115,7 +115,7 @@ which flag to turn off.
 115200 serial console is synchronous and blocks the writing thread. A traced boot
 emits ~1800 such lines (~144 KB, ~12 s of blocking writes), which measurably
 changes boot timing. It is *not* an established cause of the Mach-handshake
-failures in [nextbsd#369](https://github.com/nextbsd-redux/nextbsd/issues/369):
+failures in [nextbsd#369](https://github.com/nextbsd/nextbsd/issues/369):
 disabling the trace did not make the amd64 boot green, and both #369 failure
 modes reproduce with zero `[T41]` lines. Treat the flood as a confound to
 eliminate when reading a boot log, not as a cause. Note that `boot_mutemsgs="YES"`
