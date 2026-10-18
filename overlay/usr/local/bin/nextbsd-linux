@@ -3,18 +3,19 @@
 # nextbsd-linux(1) -- enter the /compat/linux (glibc) root as yourself.
 #
 # nextbsd/nextbsd#529. A thin, non-setuid wrapper around chroot(1): it drops into
-# the Linux root with NO_NEW_PRIVS (the unprivileged_chroot gate), resolves the
-# caller's home through the root's own NSS (a directory user -> /Local|/Network/
-# Users/<name>; everyone else -> /etc/passwd), cd's there, and execs a login shell.
-# Root works unconditionally; a regular user needs
-# security.bsd.unprivileged_chroot=1 (nextbsd-kernel PR #263).
+# the Linux root, resolves the caller's home through the root's own NSS (a directory
+# user -> /Local|/Network/Users/<name>; everyone else -> /etc/passwd), cd's there,
+# and execs a login shell. It enters with -n (NO_NEW_PRIVS) so a regular user can
+# chroot (security.bsd.unprivileged_chroot=1, nextbsd-kernel 0059); trusted groups
+# (security.bsd.unprivileged_chroot_escalate, nextbsd-kernel 0060, default "0"/wheel)
+# enter without -n so they may still use setuid (sudo) in the base. Root always can.
 #
 # It unsets the host's dynamic-linker variables -- a host path in LD_PRELOAD (e.g. a
 # /System/... GUI helper) would otherwise fail to open in the base and warn on every
 # command -- and, on first zsh entry, seeds a minimal ~/.zshrc so zsh's new-user
 # wizard does not fire.
 
-emul=$(sysctl -n compat.linux.emul_path 2>/dev/null)
+emul=$(/sbin/sysctl -n compat.linux.emul_path 2>/dev/null)
 [ -d "$emul" ] || emul=/compat/linux
 
 # Host dynamic-linker settings do not apply in the base, and a host path in
@@ -26,12 +27,29 @@ shell=${SHELL:-/bin/zsh}
 [ -x "$emul$shell" ] || shell=/bin/zsh
 [ -x "$emul$shell" ] || shell=/bin/sh
 
+# chroot(1) takes `[-g][-G][-u][-n] newroot [command]`. -n (NO_NEW_PRIVS) is the
+# default so a regular user can enter (nextbsd-kernel 0059). Trusted groups -- the
+# kernel's security.bsd.unprivileged_chroot_escalate (0060, default "0"/wheel) --
+# instead drop -n so they may still use setuid (sudo) in the base. We drop it only
+# if that sysctl exists, so a kernel without 0060 still lands us sandboxed.
+# Full path: sysctl is in /sbin, which a regular user's PATH may not include, and
+# the inherited PATH is not trusted (same reason the inner script uses /usr/bin/*).
+set -- -n
+if esc=$(/sbin/sysctl -qn security.bsd.unprivileged_chroot_escalate 2>/dev/null); then
+    [ -n "$esc" ] || esc=0
+    esc=$(printf '%s' "$esc" | tr ',\t' '  ')
+    for g in $(id -G); do
+        case " $esc " in
+        *" $g "*) set -- ;;
+        esac
+    done
+fi
+
 # The inner /bin/sh resolves the home via the root's NSS (so a directory user lands
 # in /Local|/Network/Users/<name>, not the host's home), seeds a minimal ~/.zshrc on
 # a first zsh entry, then hands off to a login shell. The chosen shell is passed as $0
-# (the first arg after -c) so it needs no environment variable. No `--`: this
-# chroot(1) takes `[-g][-G][-u][-n] newroot [command]`, and /bin/sh is not an option.
-# Full paths inside: the inherited PATH is not trusted.
-exec chroot -n "$emul" /bin/sh -c \
+# (the first arg after -c) so it needs no environment variable; "$@" holds the -n flag
+# (or is empty for trusted groups). Full paths inside: the inherited PATH is not trusted.
+exec chroot "$@" "$emul" /bin/sh -c \
     'h=$(/usr/bin/getent passwd "$(/usr/bin/id -u)" 2>/dev/null | /usr/bin/cut -d: -f6); [ -n "$h" ] || h=/; export HOME="$h"; cd "$h" 2>/dev/null || cd /; case "$0" in *zsh*) [ -e .zshrc ] || printf "# created by nextbsd-linux to skip zsh new-user wizard; edit freely\n" > .zshrc 2>/dev/null ;; esac; exec "$0" -l' \
     "$shell"
