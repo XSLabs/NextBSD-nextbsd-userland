@@ -23,7 +23,10 @@
 #                             (gutted node tree) is remounted fresh and verified.
 #
 # The six ABI mounts mirror launchctl.c linux_abi_mounts() exactly; the apt cache
-# is one added data mount (persistent on the host, survives teardown).
+# and /Local + /Network (linux_data_mounts) are the added data mounts (their host
+# source dirs survive teardown; the mounts are unmounted with it), and the
+# user-aware nss_nextbsd module is built in place by nextbsd-linux-users at the
+# end of provisioning (nextbsd/nextbsd#529).
 
 set -eu
 
@@ -201,16 +204,40 @@ do_cache_unmount() {
 	fi
 }
 
-# The six ABI mounts + the persistent apt cache.
+# /Local (always present) and /Network (a directory client) nullfs-mounted into
+# the root, read-write: the nss_nextbsd module and a chrooted user's shell read
+# the same plists and homes the host does (nextbsd/nextbsd#529). Mirrors
+# launchctl.c linux_data_mounts(); a domain is mounted only when it exists here.
+do_data_mounts() {
+	e=$(real_emul)
+	for d in /Local /Network; do
+		[ -d "$d" ] || continue
+		mkdir -p "$e$d"
+		is_mounted "$e$d" || mount -t nullfs -o nocover "$d" "$e$d" || info "warn: $d not mounted in the root"
+	done
+}
+
+do_data_unmounts() {
+	e=$(real_emul)
+	for d in "$e/Local" "$e/Network"; do
+		if is_mounted "$d"; then
+			umount "$d" 2>/dev/null || info "warn: umount $d failed (busy?)"
+		fi
+	done
+}
+
+# The six ABI mounts + the persistent apt cache + the /Local + /Network data mounts.
 do_mount_all() {
 	do_mounts
 	do_cache_mount
+	do_data_mounts
 }
 
 # Reverse-dependency order: children (dev/shm, dev/fd) before dev; then the rest.
 do_unmounts() {
 	e=$(real_emul)
 	do_cache_unmount
+	do_data_unmounts
 	for d in "$e/tmp" "$e/dev/shm" "$e/dev/fd" "$e/dev" "$e/sys" "$e/proc"; do
 		if is_mounted "$d"; then
 			umount "$d" 2>/dev/null || info "warn: umount $d failed (busy?) -- a process in the root holds it; teardown will abort"
@@ -482,6 +509,15 @@ do_provision() {
 	do_reprovision
 	do_mount_all
 	do_verify
+	# User-aware identity (nextbsd/nextbsd#529): build the nss_nextbsd module in
+	# the base now that its /tmp + /Local + /Network mounts are up. Best-effort:
+	# a failed build leaves a usable base (directory users just won't resolve) --
+	# the in-base compiler is gone either way, so re-run nextbsd-linux-users alone.
+	if here=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) && [ -x "$here/nextbsd-linux-users" ]; then
+		"$here/nextbsd-linux-users" || info "warn: module build failed; base usable but directory users will not resolve -- re-run nextbsd-linux-users"
+	else
+		info "warn: nextbsd-linux-users not found next to this bootstrap; directory users will not resolve"
+	fi
 	info "done: $e is Devuan $DEVUAN_SUITE ($a); six ABI mounts up"
 }
 

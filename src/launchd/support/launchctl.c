@@ -167,6 +167,7 @@ static pid_t fwexec(const char *const *argv, int *wstatus);
 #ifdef __FreeBSD__
 static void domain_mkdirs(void);
 static void linux_abi_mounts(void);
+static void linux_data_mounts(void);
 #endif
 static void do_potential_fsck(void);
 static bool path_check(const char *path);
@@ -2462,6 +2463,10 @@ system_specific_bootstrap(bool sflag)
 	 * /etc/sysctl.conf (a moved compat.linux.emul_path is in effect), the
 	 * fstab pass and the /tmp and /var/run sweep, and before load -D all. */
 	linux_abi_mounts();
+	/* /Local + /Network (nextbsd/nextbsd#529): the data the user-aware NSS
+	 * module and a chrooted user's shell read. After the ABI mounts so the
+	 * emul root exists. */
+	linux_data_mounts();
 #endif
 
 	if (path_check("/usr/libexec/dirhelper")) {
@@ -4201,6 +4206,40 @@ linux_abi_mounts(void)
 		(void)snprintf(path, sizeof(path), "%s/tmp", emul);
 		bootstrap_mkdirs(path);
 		linux_mount("nullfs", tmp, path, "nocover");
+	}
+}
+
+/*
+ * Persistent user-data mounts (nextbsd/nextbsd#529): nullfs /Local and, on a
+ * directory client, /Network into the Linux root -- read-write, so the base's
+ * nss_nextbsd module and a user's shell see the same plists and homes the host
+ * does. These are data mounts, distinct from the ABI filesystems above. Each is
+ * mounted only when that domain actually exists on this host: every machine has
+ * /Local, but /Network is populated only where a user has joined a directory
+ * (an empty /Network mount point still comes from domain_mkdirs).
+ */
+static void
+linux_data_mounts(void)
+{
+	char root[MAXPATHLEN], emul[MAXPATHLEN], path[MAXPATHLEN];
+	struct stat st;
+	size_t len = sizeof(root);
+	static const char *const data[] = { "/Local", "/Network" };
+	size_t i;
+
+	if (sysctlbyname("compat.linux.emul_path", root, &len, NULL, 0) != 0 || root[0] != '/') {
+		return;
+	}
+	if (realpath(root, emul) == NULL) {
+		return;
+	}
+	for (i = 0; i < nitems(data); i++) {
+		if (stat(data[i], &st) != 0 || !S_ISDIR(st.st_mode)) {
+			continue;		/* no such domain on this host */
+		}
+		(void)snprintf(path, sizeof(path), "%s%s", emul, data[i]);
+		bootstrap_mkdirs(path);
+		linux_mount("nullfs", data[i], path, "nocover");
 	}
 }
 #endif
