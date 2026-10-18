@@ -387,9 +387,12 @@ do_bootstrap() {
 		rm -f "$e/etc/resolv.conf" 2>/dev/null || true
 		cp -f /etc/resolv.conf "$e/etc/resolv.conf" || true
 	fi
-	# apt needs a source; point it at the Devuan suite. trusted=yes skips Release
-	# signature checks (the Devuan archive key is absent from the minimal base's
-	# Debian keyring) -- an acceptable bootstrap tradeoff from a pinned mirror.
+	# apt needs a source; point it at the Devuan suite. [trusted=yes] skips Release
+	# signature checks while the keyring is absent (the minimal base's Debian keyring
+	# has no Devuan key) -- it is only there long enough to *fetch* the base. The
+	# devuan-keyring step below installs the real key and drops [trusted=yes] so the
+	# finished base verifies its mirrors; if that step can't fetch the keyring (the
+	# pinned mirror is down) it leaves [trusted=yes] in place as the fallback.
 	mkdir -p "$e/etc/apt"
 	printf 'deb [trusted=yes] %s %s main\n' "$DEVUAN_MIRROR" "$DEVUAN_SUITE" > "$e/etc/apt/sources.list"
 	# The Devuan merged index is large; the 24 MB default MMap cache overflows on
@@ -419,6 +422,17 @@ do_bootstrap() {
 	chroot "$e" /usr/bin/apt-get -o APT::Cache-Start=536870912 update || info "apt-get update failed; continuing"
 	chroot "$e" /usr/bin/apt-get -o APT::Cache-Start=536870912 install -y --no-install-recommends $BASE_EXTRA $CLIENT_LIBS || die "apt-get install failed"
 	chroot "$e" /usr/bin/dpkg --configure -a || die "final dpkg --configure failed"
+	# Now that the mirror is reachable, install the Devuan release keyring and drop
+	# [trusted=yes] so the finished base *verifies* its Release signatures instead of
+	# trusting unconditionally (the latter is one step from installing unverified
+	# packages). If the keyring cannot be fetched -- e.g. the pinned mirror is down --
+	# keep [trusted=yes] so apt still works; that is the bootstrap tradeoff above.
+	if chroot "$e" /usr/bin/apt-get -o APT::Cache-Start=536870912 install -y --no-install-recommends devuan-keyring; then
+		printf 'deb %s %s main\n' "$DEVUAN_MIRROR" "$DEVUAN_SUITE" > "$e/etc/apt/sources.list"
+		chroot "$e" /usr/bin/apt-get -o APT::Cache-Start=536870912 update || info "verified apt-get update failed; continuing"
+	else
+		info "warn: could not install devuan-keyring; keeping [trusted=yes] (apt works without signature checks)"
+	fi
 	do_zsh_config
 
 	rm -rf "$WORK"
