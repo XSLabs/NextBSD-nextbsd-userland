@@ -1,0 +1,1823 @@
+#!/bin/sh
+#
+# nextbsd-linux-users(8) -- give the /compat/linux (glibc) base a user-aware
+# identity provider: the nss_nextbsd NSS module, built natively inside the base.
+#
+# nextbsd/nextbsd#529. Called at the end of nextbsd-linux-bootstrap, after the
+# base is provisioned and its ABI + /tmp mounts are up. Run as root.
+#
+# The base ships no compiler and the bootstrap's base-only rule (nextbsd#527)
+# forbids a host /usr/local one, so the build happens IN the base: write the
+# vendored module source into the chroot, apt-get a compiler into the chroot,
+# build libnss_nextbsd.so.2 natively (against the base's own glibc), set the
+# chroot's /etc/nsswitch.conf, then remove the compiler, leaving a minimal base
+# with just the module. The module reads the host's DirectoryServices plists
+# through the /Local and /Network mounts (the same files the host uses), so a
+# user's uid/gid/home/shell resolve inside the root; a missing plist makes the
+# source unavailable and `files` answers.
+#
+# The source is vendored below (heredocs) -- there is no separate src/ tree: the
+# module is a base-provisioning artifact and this script is the thing that builds
+# it. The portable core (plist, dsdb) is a copy of src/nss_directory_services
+# (keep the two in sync); only the nsswitch glue (nss_nextbsd.c) is new -- it
+# speaks glibc's _nss_* ABI instead of FreeBSD's ns_mtab, and packs into glibc's
+# struct passwd/group.
+
+set -eu
+
+die()  { printf 'nextbsd-linux-users: %s\n' "$*" >&2; exit 1; }
+info() { printf 'nextbsd-linux-users: %s\n' "$*"; }
+
+EMUL_FALLBACK=/compat/linux
+
+emul_path() {
+	p=$(sysctl -n compat.linux.emul_path 2>/dev/null || true)
+	case $p in
+	/*) printf '%s' "$p" ;;
+	*)  printf '%s' "$EMUL_FALLBACK" ;;
+	esac
+}
+
+real_emul() {
+	e=$(emul_path); mkdir -p "$e" 2>/dev/null || true
+	(cd "$e" 2>/dev/null && pwd -P) || printf '%s' "$e"
+}
+
+host_arch() {
+	case $(uname -m) in
+	amd64 | x86_64)  printf 'amd64' ;;
+	arm64 | aarch64) printf 'arm64' ;;
+	*)               die "unsupported host arch: $(uname -m)" ;;
+	esac
+}
+
+# The Debian multiarch tuple for the base's NSS module dir.
+multiarch() {
+	case $(host_arch) in
+	amd64) printf 'x86_64-linux-gnu' ;;
+	arm64) printf 'aarch64-linux-gnu' ;;
+	esac
+}
+
+require_root() { [ "$(id -u)" = 0 ] || die "must run as root"; }
+
+# The module source, written into $1. It must be a directory visible inside the
+# chroot -- the caller passes one under the base's /tmp (nullfs to the host).
+write_source() {
+	d=$1
+	mkdir -p "$d"
+
+	cat > "$d/plist.h" <<'NBS_PLIST_H'
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026 Joseph Maloney
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+/*
+ * Vendored into nextbsd-linux-users for the glibc nss_nextbsd module. Keep in
+ * sync with src/nss_directory_services/plist.h. A small reader for XML property
+ * lists: dict, array, string, integer, true and false, which is all the
+ * DirectoryServices plists use. Other value types (real, date, data) are parsed
+ * and kept as PL_OTHER so the document still loads. CoreFoundation is
+ * deliberately not used: this runs inside every process that resolves a user or
+ * group.
+ */
+
+#ifndef NBS_PLIST_H
+#define NBS_PLIST_H
+
+#include <stddef.h>
+
+enum pl_type {
+	PL_DICT,
+	PL_ARRAY,
+	PL_STRING,
+	PL_INTEGER,
+	PL_BOOL,
+	PL_OTHER
+};
+
+struct pl_node {
+	enum pl_type	 type;
+	char		*key;		/* set on the children of a dict */
+	char		*str;		/* PL_STRING */
+	long long	 num;		/* PL_INTEGER, PL_BOOL (0 or 1) */
+	struct pl_node	**children;	/* PL_DICT, PL_ARRAY */
+	size_t		 nchildren;
+};
+
+/* Parse a whole document; returns the root value or NULL if malformed. */
+struct pl_node	*pl_parse(const char *buf, size_t len);
+void		 pl_free(struct pl_node *node);
+
+/* Dict accessors. All return NULL / -1 when the key is absent or the value has
+ * an unexpected type. Integers also accept a numeric string, and booleans also
+ * accept an integer or the strings YES/NO/true/false. */
+const struct pl_node	*pl_dict_get(const struct pl_node *dict, const char *key);
+const char		*pl_dict_string(const struct pl_node *dict, const char *key);
+int			 pl_dict_integer(const struct pl_node *dict, const char *key,
+			    long long *out);
+int			 pl_dict_bool(const struct pl_node *dict, const char *key,
+			    int *out);
+
+#endif /* NBS_PLIST_H */
+NBS_PLIST_H
+
+	cat > "$d/plist.c" <<'NBS_PLIST_C'
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026 Joseph Maloney
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+/* Vendored into nextbsd-linux-users; keep in sync with
+ * src/nss_directory_services/plist.c. */
+
+#include <ctype.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+#include "plist.h"
+
+#define PL_MAX_DEPTH	32
+
+struct parser {
+	const char	*p;
+	const char	*end;
+	int		 depth;
+};
+
+static struct pl_node *parse_value(struct parser *ps);
+
+static struct pl_node *
+node_new(enum pl_type type)
+{
+	struct pl_node *n;
+
+	n = calloc(1, sizeof(*n));
+	if (n != NULL)
+		n->type = type;
+	return (n);
+}
+
+void
+pl_free(struct pl_node *node)
+{
+	size_t i;
+
+	if (node == NULL)
+		return;
+	for (i = 0; i < node->nchildren; i++)
+		pl_free(node->children[i]);
+	free(node->children);
+	free(node->key);
+	free(node->str);
+	free(node);
+}
+
+static int
+node_append(struct pl_node *parent, struct pl_node *child)
+{
+	struct pl_node **nc;
+	size_t cap;
+
+	if ((parent->nchildren & (parent->nchildren + 1)) == 0) {
+		/* grow at 0, 1, 3, 7, ... */
+		cap = parent->nchildren * 2 + 1;
+		nc = realloc(parent->children, cap * sizeof(*nc));
+		if (nc == NULL)
+			return (-1);
+		parent->children = nc;
+	}
+	parent->children[parent->nchildren++] = child;
+	return (0);
+}
+
+static void
+skip_ws(struct parser *ps)
+{
+	while (ps->p < ps->end && isspace((unsigned char)*ps->p))
+		ps->p++;
+}
+
+static int
+starts_with(const struct parser *ps, const char *s)
+{
+	size_t n = strlen(s);
+
+	return ((size_t)(ps->end - ps->p) >= n && memcmp(ps->p, s, n) == 0);
+}
+
+/* Skip to just past the next occurrence of `s`. */
+static int
+skip_past(struct parser *ps, const char *s)
+{
+	size_t n = strlen(s);
+	const char *q;
+
+	for (q = ps->p; q + n <= ps->end; q++) {
+		if (memcmp(q, s, n) == 0) {
+			ps->p = q + n;
+			return (0);
+		}
+	}
+	return (-1);
+}
+
+/*
+ * Skip the XML declaration, comments, the DOCTYPE and whitespace that may
+ * sit between elements.
+ */
+static int
+skip_misc(struct parser *ps)
+{
+	for (;;) {
+		skip_ws(ps);
+		if (starts_with(ps, "<?")) {
+			if (skip_past(ps, "?>") == -1)
+				return (-1);
+		} else if (starts_with(ps, "<!--")) {
+			if (skip_past(ps, "-->") == -1)
+				return (-1);
+		} else if (starts_with(ps, "<!")) {
+			if (skip_past(ps, ">") == -1)
+				return (-1);
+		} else {
+			return (0);
+		}
+	}
+}
+
+/*
+ * Read an opening tag at ps->p: "<name ...>" or "<name .../>". Stores the
+ * name (NUL-terminated, at most namelen-1 bytes) and whether it was
+ * self-closing. Leaves ps->p just past the '>'.
+ */
+static int
+read_open_tag(struct parser *ps, char *name, size_t namelen, int *selfclose)
+{
+	size_t i = 0;
+
+	if (ps->p >= ps->end || *ps->p != '<')
+		return (-1);
+	ps->p++;
+	while (ps->p < ps->end && !isspace((unsigned char)*ps->p) &&
+	    *ps->p != '>' && *ps->p != '/') {
+		if (i + 1 >= namelen)
+			return (-1);
+		name[i++] = *ps->p++;
+	}
+	name[i] = '\0';
+	if (i == 0)
+		return (-1);
+	*selfclose = 0;
+	/* attributes are not used by plists; skip to the end of the tag */
+	while (ps->p < ps->end && *ps->p != '>') {
+		if (*ps->p == '/' && ps->p + 1 < ps->end && ps->p[1] == '>')
+			*selfclose = 1;
+		ps->p++;
+	}
+	if (ps->p >= ps->end)
+		return (-1);
+	ps->p++;		/* '>' */
+	return (0);
+}
+
+/* Expect "</name>" at ps->p (after optional whitespace). */
+static int
+read_close_tag(struct parser *ps, const char *name)
+{
+	size_t n = strlen(name);
+
+	skip_ws(ps);
+	if (!starts_with(ps, "</"))
+		return (-1);
+	ps->p += 2;
+	if ((size_t)(ps->end - ps->p) < n || memcmp(ps->p, name, n) != 0)
+		return (-1);
+	ps->p += n;
+	skip_ws(ps);
+	if (ps->p >= ps->end || *ps->p != '>')
+		return (-1);
+	ps->p++;
+	return (0);
+}
+
+static int
+append_char(char **buf, size_t *len, size_t *cap, char c)
+{
+	char *nb;
+
+	if (*len + 1 >= *cap) {
+		*cap = *cap ? *cap * 2 : 32;
+		nb = realloc(*buf, *cap);
+		if (nb == NULL)
+			return (-1);
+		*buf = nb;
+	}
+	(*buf)[(*len)++] = c;
+	(*buf)[*len] = '\0';
+	return (0);
+}
+
+static int
+append_utf8(char **buf, size_t *len, size_t *cap, unsigned long cp)
+{
+	unsigned char out[4];
+	int n, i;
+
+	if (cp < 0x80) {
+		out[0] = (unsigned char)cp; n = 1;
+	} else if (cp < 0x800) {
+		out[0] = 0xc0 | (cp >> 6);
+		out[1] = 0x80 | (cp & 0x3f); n = 2;
+	} else if (cp < 0x10000) {
+		out[0] = 0xe0 | (cp >> 12);
+		out[1] = 0x80 | ((cp >> 6) & 0x3f);
+		out[2] = 0x80 | (cp & 0x3f); n = 3;
+	} else if (cp < 0x110000) {
+		out[0] = 0xf0 | (cp >> 18);
+		out[1] = 0x80 | ((cp >> 12) & 0x3f);
+		out[2] = 0x80 | ((cp >> 6) & 0x3f);
+		out[3] = 0x80 | (cp & 0x3f); n = 4;
+	} else {
+		return (-1);
+	}
+	for (i = 0; i < n; i++)
+		if (append_char(buf, len, cap, (char)out[i]) == -1)
+			return (-1);
+	return (0);
+}
+
+/*
+ * Read text content up to the next '<', decoding the five XML entities
+ * and numeric character references. Returns a malloc'd string ("" when
+ * empty).
+ */
+static char *
+read_text(struct parser *ps)
+{
+	char *buf = NULL;
+	size_t len = 0, cap = 0;
+	const char *semi;
+	unsigned long cp;
+	char *ep;
+
+	if (append_char(&buf, &len, &cap, '\0') == -1)
+		return (NULL);
+	len = 0;
+	while (ps->p < ps->end && *ps->p != '<') {
+		if (*ps->p != '&') {
+			if (append_char(&buf, &len, &cap, *ps->p++) == -1)
+				goto fail;
+			continue;
+		}
+		semi = memchr(ps->p, ';', ps->end - ps->p);
+		if (semi == NULL || semi - ps->p > 10)
+			goto fail;
+		if (starts_with(ps, "&amp;"))
+			cp = '&';
+		else if (starts_with(ps, "&lt;"))
+			cp = '<';
+		else if (starts_with(ps, "&gt;"))
+			cp = '>';
+		else if (starts_with(ps, "&quot;"))
+			cp = '"';
+		else if (starts_with(ps, "&apos;"))
+			cp = '\'';
+		else if (starts_with(ps, "&#x") || starts_with(ps, "&#X")) {
+			errno = 0;
+			cp = strtoul(ps->p + 3, &ep, 16);
+			if (ep != semi || errno != 0)
+				goto fail;
+		} else if (starts_with(ps, "&#")) {
+			errno = 0;
+			cp = strtoul(ps->p + 2, &ep, 10);
+			if (ep != semi || errno != 0)
+				goto fail;
+		} else
+			goto fail;
+		if (append_utf8(&buf, &len, &cap, cp) == -1)
+			goto fail;
+		ps->p = semi + 1;
+	}
+	return (buf);
+fail:
+	free(buf);
+	return (NULL);
+}
+
+static struct pl_node *
+parse_dict(struct parser *ps)
+{
+	struct pl_node *dict, *val;
+	char tag[16];
+	char *key;
+	int selfclose;
+
+	dict = node_new(PL_DICT);
+	if (dict == NULL)
+		return (NULL);
+	for (;;) {
+		if (skip_misc(ps) == -1)
+			goto fail;
+		if (starts_with(ps, "</dict"))
+			break;
+		if (read_open_tag(ps, tag, sizeof(tag), &selfclose) == -1 ||
+		    strcmp(tag, "key") != 0)
+			goto fail;
+		if (selfclose)
+			key = strdup("");
+		else {
+			key = read_text(ps);
+			if (key == NULL || read_close_tag(ps, "key") == -1) {
+				free(key);
+				goto fail;
+			}
+		}
+		if (key == NULL)
+			goto fail;
+		val = parse_value(ps);
+		if (val == NULL) {
+			free(key);
+			goto fail;
+		}
+		val->key = key;
+		if (node_append(dict, val) == -1) {
+			pl_free(val);
+			goto fail;
+		}
+	}
+	if (read_close_tag(ps, "dict") == -1)
+		goto fail;
+	return (dict);
+fail:
+	pl_free(dict);
+	return (NULL);
+}
+
+static struct pl_node *
+parse_array(struct parser *ps)
+{
+	struct pl_node *arr, *val;
+
+	arr = node_new(PL_ARRAY);
+	if (arr == NULL)
+		return (NULL);
+	for (;;) {
+		if (skip_misc(ps) == -1)
+			goto fail;
+		if (starts_with(ps, "</array"))
+			break;
+		val = parse_value(ps);
+		if (val == NULL)
+			goto fail;
+		if (node_append(arr, val) == -1) {
+			pl_free(val);
+			goto fail;
+		}
+	}
+	if (read_close_tag(ps, "array") == -1)
+		goto fail;
+	return (arr);
+fail:
+	pl_free(arr);
+	return (NULL);
+}
+
+/* A leaf element with text content: string, integer, real, date, data. */
+static struct pl_node *
+parse_leaf(struct parser *ps, const char *tag, enum pl_type type, int selfclose)
+{
+	struct pl_node *n;
+	char *text, *ep;
+
+	n = node_new(type);
+	if (n == NULL)
+		return (NULL);
+	if (selfclose)
+		text = strdup("");
+	else {
+		text = read_text(ps);
+		if (text != NULL && read_close_tag(ps, tag) == -1) {
+			free(text);
+			text = NULL;
+		}
+	}
+	if (text == NULL)
+		goto fail;
+	switch (type) {
+	case PL_STRING:
+		n->str = text;
+		return (n);
+	case PL_INTEGER:
+		errno = 0;
+		n->num = strtoll(text, &ep, 10);
+		if (ep == text || *ep != '\0' || errno != 0) {
+			free(text);
+			goto fail;
+		}
+		free(text);
+		return (n);
+	default:
+		free(text);
+		return (n);
+	}
+fail:
+	pl_free(n);
+	return (NULL);
+}
+
+static struct pl_node *
+parse_value(struct parser *ps)
+{
+	struct pl_node *n;
+	char tag[16];
+	int selfclose;
+
+	if (ps->depth >= PL_MAX_DEPTH)
+		return (NULL);
+	if (skip_misc(ps) == -1)
+		return (NULL);
+	if (read_open_tag(ps, tag, sizeof(tag), &selfclose) == -1)
+		return (NULL);
+	ps->depth++;
+	if (strcmp(tag, "dict") == 0)
+		n = selfclose ? node_new(PL_DICT) : parse_dict(ps);
+	else if (strcmp(tag, "array") == 0)
+		n = selfclose ? node_new(PL_ARRAY) : parse_array(ps);
+	else if (strcmp(tag, "string") == 0)
+		n = parse_leaf(ps, tag, PL_STRING, selfclose);
+	else if (strcmp(tag, "integer") == 0)
+		n = parse_leaf(ps, tag, PL_INTEGER, selfclose);
+	else if (strcmp(tag, "true") == 0 || strcmp(tag, "false") == 0) {
+		n = NULL;
+		if (selfclose || read_close_tag(ps, tag) == 0) {
+			n = node_new(PL_BOOL);
+			if (n != NULL)
+				n->num = (tag[0] == 't');
+		}
+	} else if (strcmp(tag, "real") == 0 || strcmp(tag, "date") == 0 ||
+	    strcmp(tag, "data") == 0)
+		n = parse_leaf(ps, tag, PL_OTHER, selfclose);
+	else
+		n = NULL;
+	ps->depth--;
+	return (n);
+}
+
+struct pl_node *
+pl_parse(const char *buf, size_t len)
+{
+	struct parser ps;
+	struct pl_node *root;
+	char tag[16];
+	int selfclose;
+
+	ps.p = buf;
+	ps.end = buf + len;
+	ps.depth = 0;
+	if (skip_misc(&ps) == -1)
+		return (NULL);
+	if (read_open_tag(&ps, tag, sizeof(tag), &selfclose) == -1 ||
+	    strcmp(tag, "plist") != 0 || selfclose)
+		return (NULL);
+	root = parse_value(&ps);
+	if (root == NULL)
+		return (NULL);
+	if (read_close_tag(&ps, "plist") == -1) {
+		pl_free(root);
+		return (NULL);
+	}
+	return (root);
+}
+
+const struct pl_node *
+pl_dict_get(const struct pl_node *dict, const char *key)
+{
+	size_t i;
+
+	if (dict == NULL || dict->type != PL_DICT)
+		return (NULL);
+	for (i = 0; i < dict->nchildren; i++)
+		if (strcmp(dict->children[i]->key, key) == 0)
+			return (dict->children[i]);
+	return (NULL);
+}
+
+const char *
+pl_dict_string(const struct pl_node *dict, const char *key)
+{
+	const struct pl_node *n = pl_dict_get(dict, key);
+
+	if (n == NULL || n->type != PL_STRING)
+		return (NULL);
+	return (n->str);
+}
+
+int
+pl_dict_integer(const struct pl_node *dict, const char *key, long long *out)
+{
+	const struct pl_node *n = pl_dict_get(dict, key);
+	char *ep;
+	long long v;
+
+	if (n == NULL)
+		return (-1);
+	switch (n->type) {
+	case PL_INTEGER:
+		*out = n->num;
+		return (0);
+	case PL_STRING:
+		if (n->str[0] == '\0')
+			return (-1);
+		errno = 0;
+		v = strtoll(n->str, &ep, 10);
+		if (*ep != '\0' || errno != 0)
+			return (-1);
+		*out = v;
+		return (0);
+	default:
+		return (-1);
+	}
+}
+
+int
+pl_dict_bool(const struct pl_node *dict, const char *key, int *out)
+{
+	const struct pl_node *n = pl_dict_get(dict, key);
+
+	if (n == NULL)
+		return (-1);
+	switch (n->type) {
+	case PL_BOOL:
+	case PL_INTEGER:
+		*out = (n->num != 0);
+		return (0);
+	case PL_STRING:
+		if (strcasecmp(n->str, "yes") == 0 ||
+		    strcasecmp(n->str, "true") == 0 || strcmp(n->str, "1") == 0)
+			*out = 1;
+		else if (strcasecmp(n->str, "no") == 0 ||
+		    strcasecmp(n->str, "false") == 0 ||
+		    strcmp(n->str, "0") == 0 || n->str[0] == '\0')
+			*out = 0;
+		else
+			return (-1);
+		return (0);
+	default:
+		return (-1);
+	}
+}
+NBS_PLIST_C
+
+	cat > "$d/dsdb.h" <<'NBS_DSDB_H'
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026 Joseph Maloney
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+/*
+ * Vendored into nextbsd-linux-users; keep in sync with
+ * src/nss_directory_services/dsdb.h. The DirectoryServices database: which
+ * plist is in use, a cached parse of it, and lookups. Everything here is plain
+ * libc; the nsswitch glue (nss_nextbsd.c) does the packing into glibc's struct
+ * passwd/group. Callers hold dsdb_lock() across a refresh, the lookup and the
+ * pack, so the record they read cannot be freed by a reload underneath them.
+ */
+
+#ifndef NBS_DSDB_H
+#define NBS_DSDB_H
+
+#include <sys/types.h>
+#include <stddef.h>
+
+#define DS_LOCAL_DIR	"/Local/Library/DirectoryServices"
+#define DS_NETWORK_DIR	"/Network/Library/DirectoryServices"
+#define DS_USERS_PLIST	"Users.plist"
+#define DS_GROUPS_PLIST	"Groups.plist"
+#define DS_ETC_GROUP	"/etc/group"
+
+#define DS_NOBODY_ID	65534
+#define DS_DEFAULT_SHELL "/usr/sbin/nologin"
+
+struct ds_user {
+	char	*name;
+	char	*real;		/* realName, "" when absent */
+	char	*shell;		/* shell, DS_DEFAULT_SHELL when absent */
+	char	*hash;		/* passwordHash, NULL when absent */
+	uid_t	 uid;
+	gid_t	 gid;
+	int	 nopass;	/* noPassword */
+};
+
+struct ds_group {
+	char	 *name;
+	gid_t	  gid;
+	char	**members;
+	size_t	  nmembers;
+};
+
+enum dsdb_status {
+	DSDB_OK,
+	DSDB_UNAVAIL		/* file missing or unparsable: let `files` answer */
+};
+
+void	dsdb_lock(void);
+void	dsdb_unlock(void);
+void	dsdb_atfork_child(void);
+
+/* Bring the cache up to date with whichever file is in use. Lock held. */
+enum dsdb_status	dsdb_refresh_users(void);
+enum dsdb_status	dsdb_refresh_groups(void);
+
+/* True when the /Network copy of that plist is the one in use. Lock held. */
+int	dsdb_users_from_network(void);
+
+/* Lookups over the cached records. Lock held; results valid until unlock. */
+const struct ds_user	*dsdb_user_by_name(const char *name);
+const struct ds_user	*dsdb_user_by_uid(uid_t uid);
+const struct ds_user	*dsdb_user_at(size_t index);
+size_t			 dsdb_user_count(void);
+const struct ds_group	*dsdb_group_by_name(const char *name);
+const struct ds_group	*dsdb_group_by_gid(gid_t gid);
+const struct ds_group	*dsdb_group_at(size_t index);
+size_t			 dsdb_group_count(void);
+
+/*
+ * The group set for a user: the primary gid, every plist group whose members
+ * list the user, wheel (gid 0) for members of `admin`, and the hardware-access
+ * groups where `etcgroup` defines them. Deduplicated; *grpcnt is the full count
+ * even when it exceeds maxgrp. Returns -1 when the user is not in the users plist.
+ * Lock held.
+ */
+int	dsdb_membership(const char *name, gid_t agroup, gid_t *groups,
+	    int maxgrp, int *grpcnt, const char *etcgroup);
+
+#endif /* NBS_DSDB_H */
+NBS_DSDB_H
+
+	cat > "$d/dsdb.c" <<'NBS_DSDB_C'
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026 Joseph Maloney
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+/*
+ * Vendored into nextbsd-linux-users; keep in sync with
+ * src/nss_directory_services/dsdb.c. Plain-libc core: which plist is in use,
+ * a cached parse, lookups, and membership. glibc build notes: _GNU_SOURCE for
+ * st_mtim/strsep/getline; MIN defined here (no <sys/param.h>); the two FreeBSD
+ * pack functions are dropped (nss_nextbsd.c packs into glibc's structs).
+ */
+#define _GNU_SOURCE
+
+#include <sys/stat.h>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "dsdb.h"
+#include "plist.h"
+
+#ifndef MIN
+#define MIN(a, b)	((a) < (b) ? (a) : (b))
+#endif
+#ifndef nitems
+#define nitems(x)	(sizeof((x)) / sizeof((x)[0]))
+#endif
+/* The lock is taken and released in separate calls by design; clang's
+ * thread-safety analysis cannot follow that through these wrappers. */
+#ifndef __no_lock_analysis
+#define __no_lock_analysis
+#endif
+
+/* A plist bigger than this is not an account database. */
+#define DS_MAX_FILE	(16 * 1024 * 1024)
+
+static const char *local_dir = DS_LOCAL_DIR;
+static const char *network_dir = DS_NETWORK_DIR;
+
+static pthread_mutex_t dsdb_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * One cached plist. The identity of the loaded file (path, device, inode,
+ * modification time, size) is kept so a lookup can tell whether the file
+ * on disk is still the one that was parsed; dscli replaces the plist with
+ * rename(2), which changes the inode.
+ */
+struct ds_file {
+	const char	*base;
+	char		 path[PATH_MAX];
+	int		 network;	/* loaded from network_dir */
+	int		 loaded;
+	dev_t		 dev;
+	ino_t		 ino;
+	struct timespec	 mtim;
+	off_t		 size;
+};
+
+static struct ds_file users_file = { .base = DS_USERS_PLIST };
+static struct ds_file groups_file = { .base = DS_GROUPS_PLIST };
+
+static struct ds_user *users;
+static size_t nusers;
+static struct ds_group *groups;
+static size_t ngroups;
+
+void __no_lock_analysis
+dsdb_lock(void)
+{
+	(void)pthread_mutex_lock(&dsdb_mutex);
+}
+
+void __no_lock_analysis
+dsdb_unlock(void)
+{
+	(void)pthread_mutex_unlock(&dsdb_mutex);
+}
+
+/*
+ * After fork(2) the child has one thread and inherits the mutex in
+ * whatever state it was in; make it usable again.
+ */
+void __no_lock_analysis
+dsdb_atfork_child(void)
+{
+	pthread_mutex_t fresh = PTHREAD_MUTEX_INITIALIZER;
+
+	memcpy(&dsdb_mutex, &fresh, sizeof(dsdb_mutex));
+}
+
+#ifdef DSDB_TEST
+void
+dsdb_set_dirs(const char *local, const char *network)
+{
+	local_dir = local;
+	network_dir = network;
+	users_file.loaded = 0;
+	groups_file.loaded = 0;
+}
+#endif
+
+/* ---- record storage ------------------------------------------------------ */
+
+static void
+free_users(void)
+{
+	size_t i;
+
+	for (i = 0; i < nusers; i++) {
+		free(users[i].name);
+		free(users[i].real);
+		free(users[i].shell);
+		free(users[i].hash);
+	}
+	free(users);
+	users = NULL;
+	nusers = 0;
+}
+
+static void
+free_groups(void)
+{
+	size_t i, j;
+
+	for (i = 0; i < ngroups; i++) {
+		free(groups[i].name);
+		for (j = 0; j < groups[i].nmembers; j++)
+			free(groups[i].members[j]);
+		free(groups[i].members);
+	}
+	free(groups);
+	groups = NULL;
+	ngroups = 0;
+}
+
+/*
+ * The record's own `username`/`groupname` key wins; the dictionary key it
+ * is filed under is the fallback. Empty names are skipped.
+ */
+static const char *
+record_name(const struct pl_node *rec, const char *namekey)
+{
+	const char *n;
+
+	n = pl_dict_string(rec, namekey);
+	if (n == NULL || n[0] == '\0')
+		n = rec->key;
+	if (n == NULL || n[0] == '\0' || strchr(n, ':') != NULL)
+		return (NULL);
+	return (n);
+}
+
+static int
+id_from(const struct pl_node *rec, const char *key, unsigned long long *out)
+{
+	long long v;
+
+	if (pl_dict_integer(rec, key, &v) == -1 || v < 0 ||
+	    (unsigned long long)v > UINT32_MAX)
+		return (-1);
+	*out = (unsigned long long)v;
+	return (0);
+}
+
+static int
+build_users(const struct pl_node *root)
+{
+	struct ds_user *list, *u;
+	const struct pl_node *rec;
+	const char *name, *s;
+	unsigned long long id;
+	size_t i, n = 0;
+
+	if (root->type != PL_DICT)
+		return (-1);
+	list = calloc(root->nchildren + 1, sizeof(*list));
+	if (list == NULL)
+		return (-1);
+	for (i = 0; i < root->nchildren; i++) {
+		rec = root->children[i];
+		if (rec->type != PL_DICT)
+			continue;
+		name = record_name(rec, "username");
+		if (name == NULL)
+			continue;
+		u = &list[n];
+		u->name = strdup(name);
+		s = pl_dict_string(rec, "realName");
+		u->real = strdup(s != NULL ? s : "");
+		s = pl_dict_string(rec, "shell");
+		u->shell = strdup(s != NULL && s[0] != '\0' ? s : DS_DEFAULT_SHELL);
+		s = pl_dict_string(rec, "passwordHash");
+		u->hash = s != NULL ? strdup(s) : NULL;
+		if (u->name == NULL || u->real == NULL || u->shell == NULL ||
+		    (s != NULL && u->hash == NULL))
+			goto fail;
+		u->uid = id_from(rec, "uid", &id) == 0 ? (uid_t)id : DS_NOBODY_ID;
+		u->gid = id_from(rec, "gid", &id) == 0 ? (gid_t)id : DS_NOBODY_ID;
+		u->nopass = (pl_dict_bool(rec, "noPassword", &(int){0}) == 0);
+		n++;
+	}
+	free_users();
+	users = list;
+	nusers = n;
+	return (0);
+fail:
+	nusers = n + 1;
+	users = list;
+	free_users();
+	return (-1);
+}
+
+static int
+build_groups(const struct pl_node *root)
+{
+	struct ds_group *list, *g;
+	const struct pl_node *rec, *mem, *m;
+	const char *name;
+	unsigned long long id;
+	size_t i, j, n = 0;
+
+	if (root->type != PL_DICT)
+		return (-1);
+	list = calloc(root->nchildren + 1, sizeof(*list));
+	if (list == NULL)
+		return (-1);
+	for (i = 0; i < root->nchildren; i++) {
+		rec = root->children[i];
+		if (rec->type != PL_DICT)
+			continue;
+		name = record_name(rec, "groupname");
+		if (name == NULL)
+			continue;
+		g = &list[n];
+		g->name = strdup(name);
+		if (g->name == NULL)
+			goto fail;
+		g->gid = id_from(rec, "gid", &id) == 0 ? (gid_t)id : DS_NOBODY_ID;
+		mem = pl_dict_get(rec, "members");
+		if (mem != NULL && mem->type == PL_ARRAY && mem->nchildren > 0) {
+			g->members = calloc(mem->nchildren, sizeof(char *));
+			if (g->members == NULL)
+				goto fail;
+			for (j = 0; j < mem->nchildren; j++) {
+				m = mem->children[j];
+				if (m->type != PL_STRING || m->str[0] == '\0' ||
+				    strchr(m->str, ',') != NULL)
+					continue;
+				g->members[g->nmembers] = strdup(m->str);
+				if (g->members[g->nmembers] == NULL)
+					goto fail;
+				g->nmembers++;
+			}
+		}
+		n++;
+	}
+	free_groups();
+	groups = list;
+	ngroups = n;
+	return (0);
+fail:
+	ngroups = n + 1;
+	groups = list;
+	free_groups();
+	return (-1);
+}
+
+/* ---- file selection and cache -------------------------------------------- */
+
+static int
+read_file(int fd, off_t size, char **out)
+{
+	char *buf;
+	ssize_t got;
+	size_t have = 0;
+
+	if (size < 0 || size > DS_MAX_FILE)
+		return (-1);
+	buf = malloc((size_t)size + 1);
+	if (buf == NULL)
+		return (-1);
+	while (have < (size_t)size) {
+		got = read(fd, buf + have, (size_t)size - have);
+		if (got < 0 && errno == EINTR)
+			continue;
+		if (got <= 0)
+			break;
+		have += (size_t)got;
+	}
+	buf[have] = '\0';
+	*out = buf;
+	return ((int)have == size ? 0 : -1);
+}
+
+static void
+unload(struct ds_file *f)
+{
+	f->loaded = 0;
+	if (f == &users_file)
+		free_users();
+	else
+		free_groups();
+}
+
+/*
+ * Pick the file (the /Network copy when it exists), and reparse it when it
+ * is not the one already cached. Every lookup calls this, so mounting or
+ * unmounting /Network switches sources at once.
+ */
+static enum dsdb_status
+refresh(struct ds_file *f)
+{
+	struct stat st;
+	struct pl_node *root;
+	char path[PATH_MAX];
+	char *buf;
+	int fd, network, rv;
+
+	rv = snprintf(path, sizeof(path), "%s/%s", network_dir, f->base);
+	if (rv < 0 || (size_t)rv >= sizeof(path))
+		goto unavail;
+	network = 1;
+	if (stat(path, &st) == -1 || !S_ISREG(st.st_mode)) {
+		rv = snprintf(path, sizeof(path), "%s/%s", local_dir, f->base);
+		if (rv < 0 || (size_t)rv >= sizeof(path))
+			goto unavail;
+		network = 0;
+		if (stat(path, &st) == -1 || !S_ISREG(st.st_mode))
+			goto unavail;
+	}
+	if (f->loaded && strcmp(path, f->path) == 0 && st.st_dev == f->dev &&
+	    st.st_ino == f->ino && st.st_size == f->size &&
+	    st.st_mtim.tv_sec == f->mtim.tv_sec &&
+	    st.st_mtim.tv_nsec == f->mtim.tv_nsec)
+		return (DSDB_OK);
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd == -1)
+		goto unavail;
+	/* Record the identity of what is actually read, not what was stat'ed. */
+	if (fstat(fd, &st) == -1 || !S_ISREG(st.st_mode) ||
+	    read_file(fd, st.st_size, &buf) == -1) {
+		(void)close(fd);
+		goto unavail;
+	}
+	(void)close(fd);
+	root = pl_parse(buf, (size_t)st.st_size);
+	free(buf);
+	if (root == NULL)
+		goto unavail;
+	rv = (f == &users_file) ? build_users(root) : build_groups(root);
+	pl_free(root);
+	if (rv == -1)
+		goto unavail;
+	strncpy(f->path, path, sizeof(f->path) - 1);
+	f->path[sizeof(f->path) - 1] = '\0';
+	f->network = network;
+	f->dev = st.st_dev;
+	f->ino = st.st_ino;
+	f->mtim = st.st_mtim;
+	f->size = st.st_size;
+	f->loaded = 1;
+	return (DSDB_OK);
+unavail:
+	unload(f);
+	return (DSDB_UNAVAIL);
+}
+
+enum dsdb_status
+dsdb_refresh_users(void)
+{
+	return (refresh(&users_file));
+}
+
+enum dsdb_status
+dsdb_refresh_groups(void)
+{
+	return (refresh(&groups_file));
+}
+
+int
+dsdb_users_from_network(void)
+{
+	return (users_file.loaded && users_file.network);
+}
+
+/* ---- lookups ------------------------------------------------------------- */
+
+const struct ds_user *
+dsdb_user_by_name(const char *name)
+{
+	size_t i;
+
+	for (i = 0; i < nusers; i++)
+		if (strcmp(users[i].name, name) == 0)
+			return (&users[i]);
+	return (NULL);
+}
+
+const struct ds_user *
+dsdb_user_by_uid(uid_t uid)
+{
+	size_t i;
+
+	for (i = 0; i < nusers; i++)
+		if (users[i].uid == uid)
+			return (&users[i]);
+	return (NULL);
+}
+
+const struct ds_user *
+dsdb_user_at(size_t index)
+{
+	return (index < nusers ? &users[index] : NULL);
+}
+
+size_t
+dsdb_user_count(void)
+{
+	return (nusers);
+}
+
+const struct ds_group *
+dsdb_group_by_name(const char *name)
+{
+	size_t i;
+
+	for (i = 0; i < ngroups; i++)
+		if (strcmp(groups[i].name, name) == 0)
+			return (&groups[i]);
+	return (NULL);
+}
+
+const struct ds_group *
+dsdb_group_by_gid(gid_t gid)
+{
+	size_t i;
+
+	for (i = 0; i < ngroups; i++)
+		if (groups[i].gid == gid)
+			return (&groups[i]);
+	return (NULL);
+}
+
+const struct ds_group *
+dsdb_group_at(size_t index)
+{
+	return (index < ngroups ? &groups[index] : NULL);
+}
+
+size_t
+dsdb_group_count(void)
+{
+	return (ngroups);
+}
+
+/* ---- membership ---------------------------------------------------------- */
+
+/*
+ * The group set is collected into a local, deduplicated list first, so the
+ * count reported to the caller is exact even for a sizing call with maxgrp 0
+ * (getgrouplist(3) callers allocate from that count and retry).
+ */
+struct gidset {
+	gid_t	list[NGROUPS_MAX + 1];
+	int	count;
+};
+
+static void
+add_gid(struct gidset *set, gid_t gid)
+{
+	int i;
+
+	for (i = 0; i < set->count; i++)
+		if (set->list[i] == gid)
+			return;
+	if (set->count < (int)nitems(set->list))
+		set->list[set->count++] = gid;
+}
+
+/*
+ * Gershwin gives every directory user the hardware-access groups, where the
+ * base system defines them. They live in /etc/group, which is read directly
+ * here: resolving them through getgrnam(3) would re-enter the name-service
+ * switch from inside a name-service method.
+ */
+static void
+add_etc_groups(const char *etcgroup, struct gidset *set)
+{
+	static const char *const wanted[] = { "audio", "video", "render", "input" };
+	FILE *fp;
+	char *line = NULL, *p, *name, *gidstr, *ep;
+	size_t cap = 0, i;
+	ssize_t len;
+	unsigned long gid;
+
+	fp = fopen(etcgroup, "re");
+	if (fp == NULL)
+		return;
+	while ((len = getline(&line, &cap, fp)) != -1) {
+		if (len > 0 && line[len - 1] == '\n')
+			line[len - 1] = '\0';
+		if (line[0] == '#' || line[0] == '\0')
+			continue;
+		p = line;
+		name = strsep(&p, ":");
+		(void)strsep(&p, ":");		/* password */
+		gidstr = strsep(&p, ":");
+		if (name == NULL || gidstr == NULL || gidstr[0] == '\0')
+			continue;
+		for (i = 0; i < nitems(wanted); i++) {
+			if (strcmp(name, wanted[i]) != 0)
+				continue;
+			errno = 0;
+			gid = strtoul(gidstr, &ep, 10);
+			if (*ep == '\0' && errno == 0 && gid <= UINT32_MAX)
+				add_gid(set, (gid_t)gid);
+			break;
+		}
+	}
+	free(line);
+	(void)fclose(fp);
+}
+
+int
+dsdb_membership(const char *name, gid_t agroup, gid_t *groups_out,
+    int maxgrp, int *grpcnt, const char *etcgroup)
+{
+	struct gidset set;
+	const struct ds_user *u;
+	const struct ds_group *g, *admin;
+	size_t i, j;
+	int n, is_admin = 0;
+
+	u = dsdb_user_by_name(name);
+	if (u == NULL)
+		return (-1);
+	set.count = 0;
+	add_gid(&set, agroup);
+	add_gid(&set, u->gid);
+	admin = dsdb_group_by_name("admin");
+	for (i = 0; i < ngroups; i++) {
+		g = &groups[i];
+		for (j = 0; j < g->nmembers; j++) {
+			if (strcmp(g->members[j], name) != 0)
+				continue;
+			add_gid(&set, g->gid);
+			if (g == admin)
+				is_admin = 1;
+			break;
+		}
+	}
+	if (is_admin)
+		add_gid(&set, 0);			/* wheel */
+	if (etcgroup != NULL)
+		add_etc_groups(etcgroup, &set);
+	n = MIN(set.count, maxgrp);
+	if (n > 0)
+		memcpy(groups_out, set.list, (size_t)n * sizeof(gid_t));
+	*grpcnt = set.count;
+	return (0);
+}
+NBS_DSDB_C
+
+	cat > "$d/nss_nextbsd.c" <<'NBS_GLUE'
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026 Joseph Maloney
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+/*
+ * nss_nextbsd: the `nextbsd` source for the passwd and group databases in
+ * nsswitch.conf(5) inside the /compat/linux (glibc) root. The glibc
+ * counterpart of the host's nss_directory_services module. It exposes glibc's
+ * _nss_* ABI (not FreeBSD's ns_mtab table) over the same portable dsdb core,
+ * and packs into glibc's struct passwd/group. A missing or unparsable plist
+ * makes the source unavailable, so the next source (files) answers.
+ */
+#define _GNU_SOURCE
+
+#include <errno.h>
+#include <grp.h>
+#include <nss.h>
+#include <pthread.h>
+#include <pwd.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "dsdb.h"
+
+/*
+ * The status values are glibc's enum nss_status, named NSS_STATUS_* in every
+ * modern glibc (>= 2.31: excalibur is 2.36, the box is 2.41). We are built
+ * natively in-chroot against the base's own glibc, so we reference those
+ * enumerators directly. No compat shim: an enumerator is invisible to the
+ * preprocessor, so an `#ifndef NSS_STATUS_*` fallback would always misfire and
+ * try to redefine them in terms of the absent classic NSS_* names.
+ */
+
+static size_t pw_cursor;
+static size_t gr_cursor;
+
+/* Re-arm the dsdb mutex after a fork so the single-threaded child does not
+ * inherit it locked. (glibc has no module register hook; a constructor runs
+ * when the module is dlopen'ed, which is the right moment.) */
+static void
+nbs_init(void)
+{
+	(void)pthread_atfork(dsdb_lock, dsdb_unlock, dsdb_atfork_child);
+}
+__attribute__((constructor)) static void nbs_ctor(void) { nbs_init(); }
+
+/* Copy s into the buffer cursor; NULL when it does not fit. */
+static char *
+put(char **cur, char *end, const char *s)
+{
+	size_t n = strlen(s) + 1;
+	char *at = *cur;
+
+	if ((size_t)(end - at) < n)
+		return (NULL);
+	memcpy(at, s, n);
+	*cur += n;
+	return (at);
+}
+
+/* Pack a record into glibc's struct passwd from the caller's buffer. The
+ * record's strings are copied into the buffer (they must not point at the
+ * dsdb cache, which a reload frees); home is /Local|/Network/Users/<name>. */
+static int
+pack_passwd(const struct ds_user *u, int privileged, int network,
+    struct passwd *pw, char *buf, size_t buflen)
+{
+	const char *passwd;
+	char *cur = buf, *end = buf + buflen;
+	int rv;
+
+	if (privileged)
+		passwd = u->nopass ? "" : (u->hash != NULL ? u->hash : "*");
+	else
+		passwd = "*";
+
+	memset(pw, 0, sizeof(*pw));
+	if ((pw->pw_name = put(&cur, end, u->name)) == NULL ||
+	    (pw->pw_passwd = put(&cur, end, passwd)) == NULL ||
+	    (pw->pw_gecos = put(&cur, end, u->real)) == NULL)
+		return (ERANGE);
+	rv = snprintf(cur, (size_t)(end - cur), "%s/Users/%s",
+	    network ? "/Network" : "/Local", u->name);
+	if (rv < 0 || (size_t)rv >= (size_t)(end - cur))
+		return (ERANGE);
+	pw->pw_dir = cur;
+	cur += rv + 1;
+	if ((pw->pw_shell = put(&cur, end, u->shell)) == NULL)
+		return (ERANGE);
+	pw->pw_uid = u->uid;
+	pw->pw_gid = u->gid;
+	return (0);
+}
+
+/* Pack a record into glibc's struct group. The member pointer array goes
+ * first (aligned), then the strings. */
+static int
+pack_group(const struct ds_group *g, struct group *grp, char *buf, size_t buflen)
+{
+	char **mem;
+	char *cur, *end = buf + buflen;
+	size_t i, align, need;
+
+	align = (size_t)(-(intptr_t)buf) & (sizeof(char *) - 1);
+	need = align + (g->nmembers + 1) * sizeof(char *);
+	if (need > buflen)
+		return (ERANGE);
+	mem = (char **)(void *)(buf + align);
+	cur = buf + need;
+
+	memset(grp, 0, sizeof(*grp));
+	if ((grp->gr_name = put(&cur, end, g->name)) == NULL ||
+	    (grp->gr_passwd = put(&cur, end, "x")) == NULL)
+		return (ERANGE);
+	for (i = 0; i < g->nmembers; i++)
+		if ((mem[i] = put(&cur, end, g->members[i])) == NULL)
+			return (ERANGE);
+	mem[g->nmembers] = NULL;
+	grp->gr_mem = mem;
+	grp->gr_gid = g->gid;
+	return (0);
+}
+
+/* ---- passwd -------------------------------------------------------------- */
+
+enum nss_status
+_nss_nextbsd_getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t n, int *errnop)
+{
+	const struct ds_user *u;
+	int rv;
+
+	dsdb_lock();
+	if (dsdb_refresh_users() != DSDB_OK) {
+		dsdb_unlock();
+		return (NSS_STATUS_UNAVAIL);
+	}
+	u = dsdb_user_by_uid(uid);
+	if (u == NULL) {
+		dsdb_unlock();
+		return (NSS_STATUS_NOTFOUND);
+	}
+	rv = pack_passwd(u, geteuid() == 0, dsdb_users_from_network(), pwd, buf, n);
+	dsdb_unlock();
+	if (rv != 0) {
+		if (errnop != NULL)
+			*errnop = rv;
+		return (NSS_STATUS_TRYAGAIN);
+	}
+	return (NSS_STATUS_SUCCESS);
+}
+
+enum nss_status
+_nss_nextbsd_getpwnam_r(const char *name, struct passwd *pwd, char *buf, size_t n, int *errnop)
+{
+	const struct ds_user *u;
+	int rv;
+
+	dsdb_lock();
+	if (dsdb_refresh_users() != DSDB_OK) {
+		dsdb_unlock();
+		return (NSS_STATUS_UNAVAIL);
+	}
+	u = dsdb_user_by_name(name);
+	if (u == NULL) {
+		dsdb_unlock();
+		return (NSS_STATUS_NOTFOUND);
+	}
+	rv = pack_passwd(u, geteuid() == 0, dsdb_users_from_network(), pwd, buf, n);
+	dsdb_unlock();
+	if (rv != 0) {
+		if (errnop != NULL)
+			*errnop = rv;
+		return (NSS_STATUS_TRYAGAIN);
+	}
+	return (NSS_STATUS_SUCCESS);
+}
+
+enum nss_status
+_nss_nextbsd_getpwent_r(struct passwd *pwd, char *buf, size_t n, int *errnop)
+{
+	const struct ds_user *u;
+	int rv;
+
+	dsdb_lock();
+	if (dsdb_refresh_users() != DSDB_OK) {
+		dsdb_unlock();
+		return (NSS_STATUS_UNAVAIL);
+	}
+	u = dsdb_user_at(pw_cursor);
+	if (u != NULL)
+		pw_cursor++;
+	if (u == NULL) {
+		dsdb_unlock();
+		return (NSS_STATUS_NOTFOUND);
+	}
+	rv = pack_passwd(u, geteuid() == 0, dsdb_users_from_network(), pwd, buf, n);
+	if (rv != 0)
+		pw_cursor--;		/* let the retry see this record */
+	dsdb_unlock();
+	if (rv != 0) {
+		if (errnop != NULL)
+			*errnop = rv;
+		return (NSS_STATUS_TRYAGAIN);
+	}
+	return (NSS_STATUS_SUCCESS);
+}
+
+enum nss_status
+_nss_nextbsd_setpwent(void)
+{
+	dsdb_lock();
+	pw_cursor = 0;
+	dsdb_unlock();
+	return (NSS_STATUS_SUCCESS);
+}
+
+enum nss_status
+_nss_nextbsd_endpwent(void)
+{
+	return (NSS_STATUS_SUCCESS);
+}
+
+/* ---- group --------------------------------------------------------------- */
+
+enum nss_status
+_nss_nextbsd_getgrgid_r(gid_t gid, struct group *grp, char *buf, size_t n, int *errnop)
+{
+	const struct ds_group *g;
+	int rv;
+
+	dsdb_lock();
+	if (dsdb_refresh_groups() != DSDB_OK) {
+		dsdb_unlock();
+		return (NSS_STATUS_UNAVAIL);
+	}
+	g = dsdb_group_by_gid(gid);
+	if (g == NULL) {
+		dsdb_unlock();
+		return (NSS_STATUS_NOTFOUND);
+	}
+	rv = pack_group(g, grp, buf, n);
+	dsdb_unlock();
+	if (rv != 0) {
+		if (errnop != NULL)
+			*errnop = rv;
+		return (NSS_STATUS_TRYAGAIN);
+	}
+	return (NSS_STATUS_SUCCESS);
+}
+
+enum nss_status
+_nss_nextbsd_getgrnam_r(const char *name, struct group *grp, char *buf, size_t n, int *errnop)
+{
+	const struct ds_group *g;
+	int rv;
+
+	dsdb_lock();
+	if (dsdb_refresh_groups() != DSDB_OK) {
+		dsdb_unlock();
+		return (NSS_STATUS_UNAVAIL);
+	}
+	g = dsdb_group_by_name(name);
+	if (g == NULL) {
+		dsdb_unlock();
+		return (NSS_STATUS_NOTFOUND);
+	}
+	rv = pack_group(g, grp, buf, n);
+	dsdb_unlock();
+	if (rv != 0) {
+		if (errnop != NULL)
+			*errnop = rv;
+		return (NSS_STATUS_TRYAGAIN);
+	}
+	return (NSS_STATUS_SUCCESS);
+}
+
+enum nss_status
+_nss_nextbsd_getgrent_r(struct group *grp, char *buf, size_t n, int *errnop)
+{
+	const struct ds_group *g;
+	int rv;
+
+	dsdb_lock();
+	if (dsdb_refresh_groups() != DSDB_OK) {
+		dsdb_unlock();
+		return (NSS_STATUS_UNAVAIL);
+	}
+	g = dsdb_group_at(gr_cursor);
+	if (g != NULL)
+		gr_cursor++;
+	if (g == NULL) {
+		dsdb_unlock();
+		return (NSS_STATUS_NOTFOUND);
+	}
+	rv = pack_group(g, grp, buf, n);
+	if (rv != 0)
+		gr_cursor--;
+	dsdb_unlock();
+	if (rv != 0) {
+		if (errnop != NULL)
+			*errnop = rv;
+		return (NSS_STATUS_TRYAGAIN);
+	}
+	return (NSS_STATUS_SUCCESS);
+}
+
+enum nss_status
+_nss_nextbsd_setgrent(void)
+{
+	dsdb_lock();
+	gr_cursor = 0;
+	dsdb_unlock();
+	return (NSS_STATUS_SUCCESS);
+}
+
+enum nss_status
+_nss_nextbsd_endgrent(void)
+{
+	return (NSS_STATUS_SUCCESS);
+}
+NBS_GLUE
+}
+
+# Install a compiler into the base, build the module natively into the base's
+# NSS module dir, set the chroot nsswitch, then remove the compiler.
+do_build() {
+	e=$(real_emul)
+	ma=$(multiarch)
+	[ -x "$e/usr/bin/apt-get" ] || die "no apt-get in the base -- is the base provisioned?"
+
+	# The module source goes under the base's /tmp (nullfs to the host), so
+	# the in-chroot compiler can read it.
+	# $scratch is the host-side path (real_emul + /tmp, nullfs to the host); the
+	# in-chroot view of the same directory is /tmp/... (there is no /compat/linux
+	# inside the chroot), so the chroot commands must use $scratch_in, not $scratch.
+	scratch="$e/tmp/nbs-mod.$$"
+	scratch_in="/tmp/nbs-mod.$$"
+	rm -rf "$scratch"
+	write_source "$scratch"
+	mkdir -p "$e/usr/lib/$ma"
+
+	info "installing a compiler in the base (transient)"
+	# gcc provides the driver + libgcc; libc6-dev provides the C library headers
+	# the module includes (stdio, pwd, grp, nss, pthread, sys/*). A fuller base
+	# already has them; the minimal bootstrap base does not -- name both, since
+	# `apt-get install gcc` alone does not pull libc6-dev.
+	chroot "$e" /usr/bin/apt-get install -y --no-install-recommends gcc libc6-dev || die "apt-get install compiler failed"
+
+	info "building libnss_nextbsd.so.2 natively in the base"
+	if ! chroot "$e" /bin/sh -c "cd '$scratch_in' && /usr/bin/gcc -shared -fPIC -o /usr/lib/$ma/libnss_nextbsd.so.2 plist.c dsdb.c nss_nextbsd.c"; then
+		rm -rf "$scratch"
+		die "module build failed"
+	fi
+	rm -rf "$scratch"
+	# glibc dlopen()s the *unversioned* module name (libnss_nextbsd.so), so a
+	# symlink from that name onto the built .so.2 is required for the module to
+	# be found at all; without it every lookup silently falls through to `files`.
+	ln -sf libnss_nextbsd.so.2 "$e/usr/lib/$ma/libnss_nextbsd.so" || die "module symlink failed"
+	chroot "$e" /bin/sh -c 'ldconfig' 2>/dev/null || info "warn: ldconfig not run (loader still scans the module dir)"
+
+	# `nextbsd` first, then the stock `files` source: directory users resolve
+	# from the plists; everyone else (system accounts) resolves from /etc.
+	printf 'passwd: nextbsd files\ngroup: nextbsd files\nshadow: nextbsd files\n' > "$e/etc/nsswitch.conf"
+	info "set $e/etc/nsswitch.conf (passwd/group/shadow: nextbsd files)"
+
+	info "removing the compiler (leaving a minimal base)"
+	chroot "$e" /usr/bin/apt-get remove -y --purge gcc 2>/dev/null || true
+	chroot "$e" /usr/bin/apt-get autoremove -y --purge 2>/dev/null || true
+
+	[ -f "$e/usr/lib/$ma/libnss_nextbsd.so.2" ] || die "module not installed"
+	info "done: $e/usr/lib/$ma/libnss_nextbsd.so.2"
+}
+
+require_root
+do_build
