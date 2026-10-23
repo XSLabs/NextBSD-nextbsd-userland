@@ -81,4 +81,25 @@ int sc_link_watch_start(sc_link_watch_cb cb, sc_addr_conflict_cb conflict_cb,
  */
 int link_active_in_store(const char *ifname);
 
+/*
+ * Wait for duplicate-address detection on `addr` (a struct in6_addr just
+ * installed on `ifname`) to finish, as Darwin's rtadv.c waits before it
+ * publishes (#407). Reads State:/Network/Interface/<if>/IPv6, which
+ * configd republishes when the kernel's DAD-completion event changes the
+ * address's flags, again on each change the link watch sees (and at least
+ * every 250 ms), and returns once that entry lists `addr` without
+ * IN6_IFF_TENTATIVE:
+ *
+ *   SC_V6_DAD_OK          DAD passed
+ *   SC_V6_DAD_DUPLICATED  DAD found the address in use
+ *   SC_V6_DAD_TIMEOUT     no answer within `timeout_ms`
+ *
+ * Blocks the calling thread; never the link-watch queue.
+ */
+#define	SC_V6_DAD_OK		0
+#define	SC_V6_DAD_DUPLICATED	1
+#define	SC_V6_DAD_TIMEOUT	2
+
+int sc_v6_dad_wait(const char *ifname, const void *addr, unsigned timeout_ms);
+
 #endif /* SC_LINK_WATCH_H */

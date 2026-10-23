@@ -68,6 +68,14 @@
  * handle_iface_key(): its entity-agnostic parse would read them as a
  * Link/AirPort change for <if>.
  *
+ * DAD completion (#407). The session also watches every
+ * State:/Network/Interface/<if>/IPv6, which configd republishes when an
+ * address's flags change. A change only wakes sc_v6_dad_wait(), blocked
+ * on the worker thread that installed a SLAAC address, which reads the
+ * value back on a throwaway session (as link_active_in_store does) and
+ * lets the address be published once it is no longer tentative. These
+ * keys never reach evaluate_interface() either.
+ *
  * Single CF translation unit, like sc_publish.c — the rest of the
  * daemon stays plain C.
  */
@@ -77,16 +85,21 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 
+#include <sys/types.h>
 #include <sys/socket.h>		/* AF_INET, AF_INET6 */
 
 #include <net/if.h>		/* IFNAMSIZ */
 #include <netinet/in.h>
+#include <netinet6/in6_var.h>	/* IN6_IFF_TENTATIVE, IN6_IFF_DUPLICATED */
 #include <arpa/inet.h>		/* inet_pton */
 
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 static sc_link_watch_cb	g_cb;
 static sc_addr_conflict_cb	g_conflict_cb;
@@ -116,6 +129,18 @@ static uint32_t		g_lease_cap_secs;
 	"State:/Network/Interface/[^/]+/" ARP_COLLISION_ENTITY "/.*"
 #define DUP_ADDRESS_PATTERN \
 	"State:/Network/Interface/[^/]+/" DUP_ADDRESS_ENTITY "/.*"
+
+/* Interface IPv6 addresses and flags, for the DAD wait (#407). */
+#define IPV6_ENTITY	"/IPv6"
+#define IPV6_PATTERN	"State:/Network/Interface/[^/]+" IPV6_ENTITY
+
+/*
+ * Bumped and broadcast on every IPv6 change; sc_v6_dad_wait() sleeps on
+ * it between reads.
+ */
+static pthread_mutex_t	g_v6_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t	g_v6_cond = PTHREAD_COND_INITIALIZER;
+static unsigned long	g_v6_gen;
 
 static void
 xlog(const char *fmt, ...)
@@ -473,6 +498,15 @@ handle_iface_key(SCDynamicStoreRef store, CFStringRef key)
 		return;
 	if (handle_conflict_key(keybuf))
 		return;
+	n = strlen(keybuf);
+	if (n > strlen(IPV6_ENTITY) &&
+	    strcmp(keybuf + n - strlen(IPV6_ENTITY), IPV6_ENTITY) == 0) {
+		pthread_mutex_lock(&g_v6_lock);
+		g_v6_gen++;
+		pthread_cond_broadcast(&g_v6_cond);
+		pthread_mutex_unlock(&g_v6_lock);
+		return;
+	}
 	p = keybuf + strlen(prefix);
 	slash = strchr(p, '/');
 	if (slash == NULL)
@@ -508,9 +542,9 @@ sc_link_watch_start(sc_link_watch_cb cb, sc_addr_conflict_cb conflict_cb,
 	SCDynamicStoreContext ctx;
 	SCDynamicStoreRef store;
 	dispatch_queue_t queue;
-	CFStringRef name, link_pat, air_pat, arp_pat, dup_pat;
+	CFStringRef name, link_pat, air_pat, arp_pat, dup_pat, v6_pat;
 	CFArrayRef patterns, existing;
-	const void *pvals[4];
+	const void *pvals[5];
 
 	g_cb = cb;
 	g_conflict_cb = conflict_cb;
@@ -554,13 +588,16 @@ sc_link_watch_start(sc_link_watch_cb cb, sc_addr_conflict_cb conflict_cb,
 	air_pat = mkstr(AIRPORT_PATTERN);
 	arp_pat = mkstr(ARP_COLLISION_PATTERN);
 	dup_pat = mkstr(DUP_ADDRESS_PATTERN);
+	v6_pat = mkstr(IPV6_PATTERN);
 	pvals[0] = link_pat;
 	pvals[1] = air_pat;
 	pvals[2] = arp_pat;
 	pvals[3] = dup_pat;
-	patterns = CFArrayCreate(NULL, pvals, 4, &kCFTypeArrayCallBacks);
+	pvals[4] = v6_pat;
+	patterns = CFArrayCreate(NULL, pvals, 5, &kCFTypeArrayCallBacks);
 	CFRelease(arp_pat);
 	CFRelease(dup_pat);
+	CFRelease(v6_pat);
 	if (!SCDynamicStoreSetNotificationKeys(store, NULL, patterns)) {
 		xlog("IPCFG-LINK-FAIL: SetNotificationKeys: %s",
 		    SCErrorString(SCError()));
@@ -584,9 +621,9 @@ sc_link_watch_start(sc_link_watch_cb cb, sc_addr_conflict_cb conflict_cb,
 	}
 	xlog("IPCFG-LINK-WATCH-OK: watching %s and %s (DHCP requires "
 	    "Link{Active} AND AirPort{Authenticated}; AirPort absent means "
-	    "ready, so wired NICs are unaffected), plus %s and %s",
+	    "ready, so wired NICs are unaffected), plus %s, %s and %s",
 	    LINK_PATTERN, AIRPORT_PATTERN, ARP_COLLISION_PATTERN,
-	    DUP_ADDRESS_PATTERN);
+	    DUP_ADDRESS_PATTERN, IPV6_PATTERN);
 
 	/*
 	 * Initial scan: a link that was already Active before the watch
@@ -618,4 +655,139 @@ sc_link_watch_start(sc_link_watch_cb cb, sc_addr_conflict_cb conflict_cb,
 	 * the watch must stay live until exit; there is no stop path.
 	 */
 	return (0);
+}
+
+/*
+ * DAD completion (#407).
+ *
+ * The flags of `addr` in State:/Network/Interface/<if>/IPv6 (configd's
+ * ev_ipv6 shape: parallel Addresses / Flags arrays), or -1 while the
+ * entry does not list it yet.
+ */
+static int
+v6_addr_flags(SCDynamicStoreRef store, CFStringRef key,
+    const struct in6_addr *addr)
+{
+	CFDictionaryRef dict;
+	CFArrayRef addrs, flags;
+	CFIndex i, n;
+	int result = -1;
+
+	dict = SCDynamicStoreCopyValue(store, key);
+	if (dict == NULL)
+		return (-1);
+	if (CFGetTypeID(dict) != CFDictionaryGetTypeID()) {
+		CFRelease(dict);
+		return (-1);
+	}
+	addrs = CFDictionaryGetValue(dict, CFSTR("Addresses"));
+	flags = CFDictionaryGetValue(dict, CFSTR("Flags"));
+	if (addrs == NULL || flags == NULL ||
+	    CFGetTypeID(addrs) != CFArrayGetTypeID() ||
+	    CFGetTypeID(flags) != CFArrayGetTypeID()) {
+		CFRelease(dict);
+		return (-1);
+	}
+	n = CFArrayGetCount(addrs);
+	if (CFArrayGetCount(flags) < n)
+		n = CFArrayGetCount(flags);
+	for (i = 0; i < n && result < 0; i++) {
+		CFStringRef s = CFArrayGetValueAtIndex(addrs, i);
+		CFNumberRef f = CFArrayGetValueAtIndex(flags, i);
+		char buf[INET6_ADDRSTRLEN];
+		struct in6_addr a;
+		int v;
+
+		if (s == NULL || CFGetTypeID(s) != CFStringGetTypeID() ||
+		    f == NULL || CFGetTypeID(f) != CFNumberGetTypeID())
+			continue;
+		if (!CFStringGetCString(s, buf, sizeof(buf),
+		    kCFStringEncodingUTF8) ||
+		    inet_pton(AF_INET6, buf, &a) != 1 ||
+		    memcmp(&a, addr, sizeof(a)) != 0)
+			continue;
+		if (CFNumberGetValue(f, kCFNumberIntType, &v))
+			result = v;
+	}
+	CFRelease(dict);
+	return (result);
+}
+
+/*
+ * The value is re-read at least this often even without a wakeup: a
+ * change notification can be raced away (see link_active_in_store), the
+ * stored value cannot.
+ */
+#define	DAD_RECHECK_MS	250
+
+int
+sc_v6_dad_wait(const char *ifname, const void *addr, unsigned timeout_ms)
+{
+	SCDynamicStoreRef store;
+	struct timespec now, end, until;
+	CFStringRef key;
+	unsigned long gen;
+	int flags, rc = SC_V6_DAD_TIMEOUT;
+	long left_ms;
+
+	(void)clock_gettime(CLOCK_MONOTONIC, &end);
+	end.tv_sec += timeout_ms / 1000;
+	end.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+	if (end.tv_nsec >= 1000000000L) {
+		end.tv_sec++;
+		end.tv_nsec -= 1000000000L;
+	}
+
+	/* Reads only: no notification registration on this session. */
+	store = SCDynamicStoreCreate(NULL, CFSTR("ipconfigd-dad"), NULL, NULL);
+	key = CFStringCreateWithFormat(NULL, NULL,
+	    CFSTR("State:/Network/Interface/%s/IPv6"), ifname);
+
+	for (;;) {
+		/* Sample the generation first so no change falls between. */
+		pthread_mutex_lock(&g_v6_lock);
+		gen = g_v6_gen;
+		pthread_mutex_unlock(&g_v6_lock);
+
+		flags = (store != NULL && key != NULL) ?
+		    v6_addr_flags(store, key, addr) : -1;
+		if (flags >= 0 && (flags & IN6_IFF_DUPLICATED) != 0) {
+			rc = SC_V6_DAD_DUPLICATED;
+			break;
+		}
+		if (flags >= 0 && (flags & IN6_IFF_TENTATIVE) == 0) {
+			rc = SC_V6_DAD_OK;
+			break;
+		}
+		(void)clock_gettime(CLOCK_MONOTONIC, &now);
+		left_ms = (long)(end.tv_sec - now.tv_sec) * 1000L +
+		    (end.tv_nsec - now.tv_nsec) / 1000000L;
+		if (left_ms <= 0) {
+			xlog("%s: DAD still tentative after %ums; proceeding",
+			    ifname, timeout_ms);
+			break;
+		}
+		if (left_ms > DAD_RECHECK_MS)
+			left_ms = DAD_RECHECK_MS;
+
+		(void)clock_gettime(CLOCK_REALTIME, &until);
+		until.tv_sec += left_ms / 1000;
+		until.tv_nsec += (left_ms % 1000) * 1000000L;
+		if (until.tv_nsec >= 1000000000L) {
+			until.tv_sec++;
+			until.tv_nsec -= 1000000000L;
+		}
+		pthread_mutex_lock(&g_v6_lock);
+		while (g_v6_gen == gen &&
+		    pthread_cond_timedwait(&g_v6_cond, &g_v6_lock,
+		    &until) == 0)
+			;
+		pthread_mutex_unlock(&g_v6_lock);
+	}
+
+	if (key != NULL)
+		CFRelease(key);
+	if (store != NULL)
+		CFRelease(store);
+	return (rc);
 }
